@@ -5,3 +5,8 @@
 /database/author_stats.db
 /settings/keys.py
 /config.json
+__pycache__/
+*/__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
