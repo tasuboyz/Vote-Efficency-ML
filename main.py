@@ -332,6 +332,91 @@ def generate_author_statistics(df):
     
     return author_stats
 
+def analyze_important_voters():
+    """Analizza i votanti importanti su più post per creare un report completo."""
+    logger.info("Iniziando analisi dei votanti importanti...")
+    
+    # Initialize blockchain connection
+    try:
+        blockchain = blockchain_connector.blockchain
+        power_symbol = blockchain_connector.power_symbol
+    except Exception as e:
+        logger.error(f"Failed to initialize blockchain connection: {str(e)}")
+        return
+    
+    try:
+        # Ottieni la storia del curator per trovare post su cui ha votato
+        history_data, _ = blockchain_connector.get_account_history(CURATOR)
+        
+        # Estrai gli unique post URLs su cui il curator ha ricevuto ricompense
+        post_urls = []
+        for h in history_data[:100]:  # Limita a 100 post per velocità
+            try:
+                author = h.get('comment_author') or h.get('author')
+                permlink = h.get('comment_permlink') or h.get('permlink')
+                post_identifier = f"@{author}/{permlink}"
+                post_urls.append(post_identifier)
+            except Exception as e:
+                continue
+        
+        logger.info(f"Trovati {len(post_urls)} post da analizzare")
+        
+        # Raccogli informazioni sui votanti
+        all_voters_data = []
+        voter_frequency = {}  # Per contare quante volte ogni votante è apparso
+        
+        for post_url in post_urls:
+            try:
+                voters = blockchain_connector.get_post_voters(post_url, min_importance=1.0)
+                
+                # Aggiorna la frequenza di voto per ogni votante
+                for voter in voters:
+                    voter_name = voter['voter']
+                    if voter_name not in voter_frequency:
+                        voter_frequency[voter_name] = 1
+                    else:
+                        voter_frequency[voter_name] += 1
+                
+                all_voters_data.extend(voters)
+                logger.info(f"Estratti {len(voters)} votanti importanti da {post_url}")
+            except Exception as e:
+                logger.error(f"Errore nell'analisi dei votanti per {post_url}: {str(e)}")
+                continue
+        
+        # Aggiungi le informazioni sulla frequenza di voto
+        for voter in all_voters_data:
+            voter_name = voter['voter']
+            voter['posts_voted'] = voter_frequency.get(voter_name, 0)
+        
+        # Genera il report Excel dei votanti
+        if all_voters_data:
+            excel_reporter = ExcelReporter('reports', CURATOR)
+            report_path = excel_reporter.save_voters_report(all_voters_data)
+            logger.info(f"Report sui votanti importanti generato: {report_path}")
+            
+            # Trova i principali 5 whale (grandi votanti per importanza)
+            top_whales = sorted(all_voters_data, key=lambda x: x['importance'], reverse=True)
+            top_whales = [v for v in top_whales if v['posts_voted'] > 1]  # Almeno 2 post votati
+            
+            if top_whales:
+                whale_info = "\n".join([
+                    f"- {v['voter']}: {v['importance']:.1f} importanza, media voto dopo {v['vote_delay_minutes']} minuti, {v['posts_voted']} post votati" 
+                    for v in top_whales[:5]
+                ])
+                logger.info(f"Top 5 whale da monitorare:\n{whale_info}")
+                
+                # Calcola la finestra di voto ottimale basata sui primi votanti importanti
+                early_voters = sorted(top_whales[:10], key=lambda x: x['vote_delay_minutes'])
+                if early_voters:
+                    optimal_window_end = max(early_voters[0]['vote_delay_minutes'] - 1, 0)
+                    optimal_window_start = max(optimal_window_end - 5, 0)
+                    logger.info(f"Finestra di voto ottimale: {optimal_window_start}-{optimal_window_end} minuti")
+        else:
+            logger.warning("Nessun dato sui votanti importante trovato")
+    
+    except Exception as e:
+        logger.error(f"Errore nell'analisi dei votanti importanti: {str(e)}")
+
 # Modify the main function to properly handle models
 def main():
     if OPERATION_MODE not in MODE_CHOICES:
@@ -439,12 +524,25 @@ def main():
 
     logger.info("Data collection completed. Starting model processing...")
 
-    # Create DataFrame and process based on operation mode
-    df = pd.DataFrame(data)
-    ensure_directories()
-    process_data_for_mode(df, OPERATION_MODE, clf_model, reg_model)
-    
-    logger.info("Operation completed successfully.")
+    try:
+        # Create DataFrame and process based on operation mode
+        df = pd.DataFrame(data)
+        ensure_directories()
+        process_data_for_mode(df, OPERATION_MODE, clf_model, reg_model)
+        
+        # Analizza i votanti importanti (solo in modalità TRAINING o TESTING)
+        if OPERATION_MODE in ["TRAINING", "TESTING"]:
+            analyze_important_voters()
+        
+        # Salva la cache dei votanti prima di terminare
+        blockchain_connector.cleanup()
+        
+        logger.info("Operation completed successfully.")
+    except Exception as e:
+        logger.error(f"Error in main execution: {str(e)}")
+        # Assicurati di salvare la cache anche in caso di errore
+        blockchain_connector.cleanup()
+        raise
 
 def collect_post_data(post, history, author, post_identifier, curator, blockchain, 
                      get_vote_data, author_efficiency_dict, author_payout_dict, power_symbol):
@@ -463,6 +561,37 @@ def collect_post_data(post, history, author, post_identifier, curator, blockchai
     vote_delay_minutes = age / 60
     
     weight = vote.weight
+
+    # Get important voters and their timing
+    important_voters = blockchain_connector.get_post_voters(post_identifier, min_importance=1.0)  # Filtra per importanza
+    top_voter_delays = []
+    
+    # Extract timing data of top voters (up to 10)
+    for voter in important_voters[:10]:
+        top_voter_delays.append({
+            'voter': voter['voter'],
+            'importance': voter['importance'],
+            'vote_delay_minutes': voter['vote_delay_minutes']
+        })
+    
+    # Sort voters by vote delay (ascending)
+    sorted_voter_delays = sorted(top_voter_delays, key=lambda x: x['vote_delay_minutes'])
+    
+    # Get optimal voting window based on when important voters voted
+    voting_window_start = None
+    voting_window_end = None
+    
+    if sorted_voter_delays:
+        # Optimal window is right before the first important voter
+        first_important_voter = sorted_voter_delays[0]
+        voting_window_end = max(first_important_voter['vote_delay_minutes'] - 1, 5)  # 1 minuto prima, ma minimo 5 minuti
+        voting_window_start = max(voting_window_end - 5, 5)  # 5 minuti prima della fine della finestra, ma minimo 5 minuti
+        
+        # Calcola un delay ottimale che è più vicino alla fine della finestra (70% verso end, 30% verso start)
+        # Questo bilancia il vantaggio di essere tra i primi votanti e evitare la penalità di curation
+        optimal_window_delay = voting_window_start + (voting_window_end - voting_window_start) * 0.7
+        
+        logger.info(f"Finestra di voto: {voting_window_start}-{voting_window_end} minuti, delay ottimale: {optimal_window_delay:.1f} minuti")
 
     curator = blockchain_connector.get_account_info(CURATOR)
 
@@ -500,8 +629,23 @@ def collect_post_data(post, history, author, post_identifier, curator, blockchai
     optimal_delay_data = db_manager.get_optimal_delay(author, BLOCKCHAIN_CHOICE)
     optimal_delay = optimal_delay_data['recent_good_delay'] if optimal_delay_data else 1440
     
+    # If we found a voting window from top voters, consider it
+    if voting_window_start is not None and voting_window_end is not None:
+        # If the efficiency was good, consider the weighted voting window as optimal
+        if efficiency > 80:
+            optimal_delay = optimal_window_delay
+    
     # Update author efficiency
     avg_efficiency = update_efficiency_average(author, efficiency, author_efficiency_dict)
+    
+    # Log important voters information for future analysis
+    if important_voters:
+        voter_info_str = "\n".join([f"- {v['voter']}: {v['importance']:.1f} importanza, votato dopo {v['vote_delay_minutes']} minuti" 
+                                 for v in important_voters[:5]])
+        logger.info(f"Top 5 votanti per {post_identifier}:\n{voter_info_str}")
+        
+        if voting_window_start is not None:
+            logger.info(f"Finestra di voto ottimale: {optimal_delay} minuti")
     
     return {
         'voting_power': vote['percent'] / 100,

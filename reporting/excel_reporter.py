@@ -47,3 +47,62 @@ class ExcelReporter:
             ]
         }
         self.save_to_excel(production_data)
+    
+    def save_voters_report(self, voters_data):
+        """Save important voters analytics.
+        
+        Args:
+            voters_data: List of dictionaries with voter data
+        """
+        if not voters_data:
+            logger.warning("No voters data to save")
+            return
+        
+        # Convert the list to a DataFrame
+        df = pd.DataFrame(voters_data)
+        
+        # Create an Excel file with separated sheets
+        voters_filepath = os.path.join(self.base_path, f'important_voters_{self.curator}.xlsx')
+        
+        with pd.ExcelWriter(voters_filepath) as writer:
+            # All voters
+            df.to_excel(writer, sheet_name='All Important Voters', index=False)
+            
+            # Top voters by importance
+            top_voters = df.sort_values('importance', ascending=False).head(20)
+            top_voters.to_excel(writer, sheet_name='Top 20 by Importance', index=False)
+            
+            # Early voters (first to vote)
+            early_voters = df.sort_values('vote_delay_minutes').head(20)
+            early_voters.to_excel(writer, sheet_name='Top 20 Fastest Voters', index=False)
+            
+            # Frequent voters (most posts voted)
+            if 'posts_voted' in df.columns:
+                frequent_voters = df.sort_values('posts_voted', ascending=False).head(20)
+                frequent_voters.to_excel(writer, sheet_name='Most Frequent Voters', index=False)
+            
+            # Optimal voting delay statistics
+            if len(df) > 0:
+                stats = {
+                    'Statistic': [
+                        'Mean Vote Delay', 
+                        'Median Vote Delay',
+                        'Min Vote Delay',
+                        'Max Vote Delay',
+                        'Optimal Vote Window Start',
+                        'Optimal Vote Window End'
+                    ],
+                    'Value': [
+                        df['vote_delay_minutes'].mean(),
+                        df['vote_delay_minutes'].median(),
+                        df['vote_delay_minutes'].min(),
+                        df['vote_delay_minutes'].max(),
+                        max(df['vote_delay_minutes'].min() - 5, 0),
+                        max(df['vote_delay_minutes'].min() - 1, 0)
+                    ]
+                }
+                stats_df = pd.DataFrame(stats)
+                stats_df.to_excel(writer, sheet_name='Voting Window Stats', index=False)
+                
+        logger.info(f"Voters report saved successfully at: {voters_filepath}")
+        return voters_filepath

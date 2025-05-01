@@ -2,9 +2,9 @@
 
 # Blockchain configuration
 BLOCKCHAIN_CHOICE = "STEEM"  # Options: "HIVE" or "STEEM"
-CURATOR = "tasuboyz"
+CURATOR = "karja"
 
-log_level = "ERROR"
+log_level = "INFO"
 
 log_file_path = "log.txt"
 
@@ -25,7 +25,7 @@ HIVE_NODES = [
 MODE_CHOICES = ["TRAINING", "TESTING", "PRODUCTION"]
 OPERATION_MODE = "TRAINING"  # Options: "TRAINING", "TESTING", "PRODUCTION"
 TEST_SIZE = 0.2
-MAX_RESULTS = 300
+MAX_RESULTS = 1000
 
 # Directory configuration
 DIRECTORIES = ['models', 'reports']

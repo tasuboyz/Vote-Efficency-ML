@@ -1,11 +1,15 @@
 import time
 import random
 import requests
+import os
+import pickle
+from datetime import datetime, timezone, timedelta
 from beem import Steem, Hive
 from beem.account import Account
 from settings.config import HIVE_NODES, STEEM_NODES, BLOCKCHAIN_CHOICE, MAX_RESULTS
 from settings.logging_config import logger
 from beem.comment import Comment
+from beem.vote import ActiveVotes, Vote
 from settings.keys import steem_posting_key, hive_posting_key
 import json 
 
@@ -17,6 +21,11 @@ class BlockchainConnector:
         self.working_node = self.get_working_node()
         self.blockchain = self._initialize_blockchain()
         self.power_symbol = "HP" if blockchain_type == "HIVE" else "SP"
+        
+        # Inizializza la cache dei voti
+        self._voters_cache = {}
+        self._cache_path = os.path.join("database", f"voters_cache_{blockchain_type.lower()}.pkl")
+        self._load_cache()
 
     def _initialize_blockchain(self):
         """Initialize blockchain instance with working node."""        
@@ -305,3 +314,204 @@ class BlockchainConnector:
             logger.error(f"Error getting dynamic global properties: {str(e)}")
             self.switch_to_backup_node()
             return self.get_dynamic_global_properties()  # Try again with new node
+
+    def _load_cache(self):
+        """Carica la cache dei votanti dal file se esiste."""
+        try:
+            if os.path.exists(self._cache_path):
+                with open(self._cache_path, 'rb') as f:
+                    cached_data = pickle.load(f)
+                    # Verifica che la cache non sia vecchia (più di 7 giorni)
+                    if 'timestamp' in cached_data and (datetime.now() - cached_data['timestamp']).days < 7:
+                        self._voters_cache = cached_data.get('voters', {})
+                        logger.info(f"Caricati {len(self._voters_cache)} record dalla cache dei votanti")
+                    else:
+                        logger.info("Cache dei votanti scaduta, verrà rigenerata")
+        except Exception as e:
+            logger.warning(f"Errore nel caricamento della cache dei votanti: {e}")
+            self._voters_cache = {}
+    
+    def _save_cache(self):
+        """Salva la cache dei votanti su file."""
+        try:
+            # Assicurati che la directory esista
+            os.makedirs(os.path.dirname(self._cache_path), exist_ok=True)
+            
+            cache_data = {
+                'timestamp': datetime.now(),
+                'voters': self._voters_cache
+            }
+            
+            with open(self._cache_path, 'wb') as f:
+                pickle.dump(cache_data, f)
+            logger.info(f"Salvati {len(self._voters_cache)} record nella cache dei votanti")
+        except Exception as e:
+            logger.warning(f"Errore nel salvataggio della cache dei votanti: {e}")
+
+    def get_post_voters(self, post_url, min_importance=0.0, use_cache=True):
+        """Get the voters of a post sorted by importance (vesting shares or rshares)
+        
+        Args:
+            post_url (str): The URL or identifier of the post
+            min_importance (float): Minimum importance threshold to filter voters
+            use_cache (bool): Whether to use cached voters data if available
+            
+        Returns:
+            list: List of dictionaries with voter information
+        """
+        # Check cache first if enabled
+        cache_key = f"{post_url}_{min_importance}"
+        if use_cache and cache_key in self._voters_cache:
+            logger.info(f"Utilizzando dati in cache per {post_url}")
+            return self._voters_cache[cache_key]
+        
+        try:
+            # Ottimizzazione: limita il numero di richieste parallele
+            start_time = time.time()
+            from beem.vote import Vote
+            
+            # Usa un timeout più breve per evitare blocchi lunghi
+            comment = Comment(post_url, blockchain_instance=self.blockchain)
+            # Ottiene i dati completi del post
+            comment_data = comment.json()
+            
+            # Estrai la data di creazione del post e assicurati che abbia timezone UTC
+            post_created = comment_data.get('created')
+            if isinstance(post_created, str):
+                post_created = datetime.strptime(post_created, '%Y-%m-%dT%H:%M:%S')
+                # Assicurati che post_created sia timezone-aware (UTC)
+                if post_created.tzinfo is None:
+                    post_created = post_created.replace(tzinfo=timezone.utc)
+            
+            # Ottiene i voti con i dettagli completi
+            active_votes = comment_data.get('active_votes', [])
+            if not active_votes and hasattr(comment, 'get_active_votes'):
+                active_votes = comment.get_active_votes()
+            
+            logger.info(f"Trovati {len(active_votes)} voti per il post {post_url}")
+            
+            # Ottimizzazione: limita il numero di voti da analizzare per post con molti voti
+            max_votes_to_process = 50  # Imposta un limite ragionevole
+            if len(active_votes) > max_votes_to_process:
+                # Ordina preliminarmente per rshares se disponibili
+                if 'rshares' in active_votes[0]:
+                    active_votes.sort(key=lambda v: float(v.get('rshares', 0)), reverse=True)
+                active_votes = active_votes[:max_votes_to_process]
+                logger.info(f"Limitata analisi ai top {max_votes_to_process} voti per {post_url}")
+            
+            # Get voters data
+            voters_data = []
+            processed_voters = 0
+            
+            # Processa i voti più significativi (in batch per maggiore efficienza)
+            for vote_data in active_votes:
+                try:
+                    voter_name = vote_data['voter']
+                    processed_voters += 1
+                    
+                    # Prima prova a ottenere rshares direttamente dal voto (più veloce)
+                    vote_rshares = float(vote_data.get('rshares', 0))
+                    
+                    # Se non ci sono rshares significativi, passa al votante successivo (ottimizzazione)
+                    if vote_rshares < 1000000 and processed_voters > 10:
+                        continue
+                    
+                    # Estrai informazioni dirette dal voto quando disponibili
+                    vote_percent = float(vote_data.get('percent', 0))
+                    
+                    # Determina quando è avvenuto il voto
+                    vote_time = vote_data.get('time')
+                    if isinstance(vote_time, str):
+                        vote_time = datetime.strptime(vote_time, '%Y-%m-%dT%H:%M:%S')
+                        if vote_time.tzinfo is None:
+                            vote_time = vote_time.replace(tzinfo=timezone.utc)
+                    
+                    # Se non abbiamo il timestamp nel voto base, prova con l'oggetto Vote (più lento)
+                    if not vote_time:
+                        try:
+                            vote = Vote(voter_name, post_url, blockchain_instance=self.blockchain)
+                            vote_time = vote.time
+                            if vote_time.tzinfo is None:
+                                vote_time = vote_time.replace(tzinfo=timezone.utc)
+                            
+                            if not vote_rshares or vote_rshares == 0:
+                                vote_rshares = float(vote.rshares)
+                            
+                            if not vote_percent or vote_percent == 0:
+                                vote_percent = vote.weight
+                        except Exception as vote_error:
+                            # Se fallisce anche questo, usa una stima
+                            if 'last_update' in vote_data:
+                                vote_time = vote_data.get('last_update')
+                                if isinstance(vote_time, str):
+                                    vote_time = datetime.strptime(vote_time, '%Y-%m-%dT%H:%M:%S')
+                                    if vote_time.tzinfo is None:
+                                        vote_time = vote_time.replace(tzinfo=timezone.utc)
+                            else:
+                                # Ultimo tentativo: usa il timestamp attuale
+                                vote_time = datetime.now(timezone.utc)
+                    
+                    # Calcola il ritardo del voto in minuti
+                    vote_delay_minutes = int((vote_time - post_created).total_seconds() / 60)
+                    
+                    # Calcola l'importanza usando rshares direttamente se disponibili
+                    importance = vote_rshares / 1e12  # Normalizza per leggibilità
+                    
+                    # Solo se l'importanza è troppo bassa, ottieni ulteriori informazioni sull'account
+                    vests = 0
+                    reputation = 0
+                    
+                    if importance < min_importance and processed_voters <= 10:
+                        try:
+                            # Ottimizzazione: ottieni informazioni sull'account solo se necessario
+                            voter_account = Account(voter_name, blockchain_instance=self.blockchain)
+                            vests = float(voter_account['vesting_shares'].amount) + float(voter_account['received_vesting_shares'].amount) - float(voter_account['delegated_vesting_shares'].amount)
+                            importance = max(importance, vests / 1e6)  # Usa il valore maggiore tra rshares e vests
+                            reputation = voter_account.get_reputation()
+                        except Exception as e:
+                            logger.debug(f"Non è stato possibile ottenere dettagli completi per {voter_name}: {e}")
+                    
+                    if importance >= min_importance or vote_rshares >= min_importance * 1e12:
+                        voters_data.append({
+                            'voter': voter_name,
+                            'weight': vote_percent,
+                            'rshares': vote_rshares,
+                            'vesting_shares': vests,
+                            'importance': importance,
+                            'vote_time': vote_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(vote_time, 'strftime') else vote_time,
+                            'vote_delay_minutes': vote_delay_minutes,
+                            'reputation': reputation
+                        })
+                except Exception as e:
+                    logger.warning(f"Error processing voter {vote_data.get('voter', 'unknown')}: {str(e)}")
+                    continue
+            
+            # Sort by importance (vesting shares o rshares)
+            voters_data.sort(key=lambda x: x['importance'], reverse=True)
+            
+            # Logga il tempo totale di esecuzione e i primi votanti importanti
+            execution_time = time.time() - start_time
+            logger.info(f"Analisi votanti completata in {execution_time:.2f} secondi")
+            
+            if voters_data:
+                top_voters = [f"{v['voter']} (dopo {v['vote_delay_minutes']} min., importanza: {v['importance']:.2f})" 
+                            for v in voters_data[:3]]
+                logger.info(f"Top votanti per {post_url}: {', '.join(top_voters)}")
+            
+            # Save to cache if the operation was successful
+            if use_cache:
+                self._voters_cache[cache_key] = voters_data
+                # Save cache every 10 new entries
+                if len(self._voters_cache) % 10 == 0:
+                    self._save_cache()
+            
+            return voters_data
+            
+        except Exception as e:
+            logger.error(f"Error getting post voters: {str(e)}")
+            return []
+
+    def cleanup(self):
+        """Pulisce e salva la cache a fine esecuzione."""
+        if self._voters_cache:
+            self._save_cache()
