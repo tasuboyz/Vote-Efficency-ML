@@ -27,6 +27,7 @@ from settings.config import (
 from settings.logging_config import logger
 from utils.beem_requests import BlockchainConnector
 from database.db_manager import DatabaseManager
+from utils.vote import calculate_vote_value_sync
 
 blockchain_connector = BlockchainConnector(BLOCKCHAIN_CHOICE)
 db_manager = DatabaseManager()
@@ -461,14 +462,32 @@ def collect_post_data(post, history, author, post_identifier, curator, blockchai
     age = (vote_time - post_creation_time).total_seconds()
     vote_delay_minutes = age / 60
     
-    # Calculate efficiency
+    weight = vote.weight
+
+    curator = blockchain_connector.get_account_info(CURATOR)
+
+    curator_total_vests = float(curator['received_vesting_shares'].amount) + float(curator['vesting_shares'].amount) - float(curator['delegated_vesting_shares'].amount)
+    
+    # Get vote value using our new function
+    vote_value_result = calculate_vote_value_sync(
+        blockchain, 
+        vote_percent=vote.percent,  # Vote weight in percent
+        effective_vests=curator_total_vests,  # Will use curator's vests
+        voting_power=10000  # Default full voting power
+    )
+    
+    teoric_reward = vote_value_result['steem_value'] / 2
+
+    steem_vote_value = vote_value_result['steem_value']
+    
+    # Calculate the actual reward
     reward_amount_vests = float(history['reward']['amount']) / 1e6
     reward_amount = blockchain_connector.convert_vests_to_power(reward_amount_vests)
-    weight = vote.weight / (100 if isinstance(blockchain, Steem) else 1000000000)
-    teoric_reward = blockchain_connector.convert_vests_to_power(weight)
-    vote_value = teoric_reward * 2
-    efficiency = (((reward_amount - teoric_reward) / teoric_reward) * 100) if vote_value > 0 else 0
     
+    # Calculate efficiency
+    efficiency = (((reward_amount - teoric_reward) / teoric_reward) * 100) if steem_vote_value > 0 else 0
+    
+    # The rest of your function remains the same
     db_manager.update_voting_delay(
         author_name=author,
         platform=BLOCKCHAIN_CHOICE,

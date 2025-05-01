@@ -19,11 +19,11 @@ class BlockchainConnector:
         self.power_symbol = "HP" if blockchain_type == "HIVE" else "SP"
 
     def _initialize_blockchain(self):
-        """Initialize blockchain instance with working node."""
+        """Initialize blockchain instance with working node."""        
         return Hive(keys=[hive_posting_key], node=self.working_node) if self.blockchain_type == "HIVE" else Steem(keys=[steem_posting_key], node=self.working_node)
 
     def convert_vests_to_power(self, amount):
-        """Convert vesting shares to HP/SP based on blockchain type."""
+        """Convert vesting shares to HP/SP based on blockchain type."""        
         try:
             if isinstance(self.blockchain, Hive):
                 return self.blockchain.vests_to_hp(float(amount))
@@ -37,7 +37,7 @@ class BlockchainConnector:
             return 0
 
     def test_node(self, node_url):
-        """Test if a node is responsive and functioning correctly."""
+        """Test if a node is responsive and functioning correctly."""        
         try:
             headers = {'Content-Type': 'application/json'}
             payload = {
@@ -63,7 +63,7 @@ class BlockchainConnector:
             return False
 
     def get_working_node(self):
-        """Get a working node from the configured list with fallback mechanism."""
+        """Get a working node from the configured list with fallback mechanism."""        
         working_nodes = []
         
         for node in self.nodes:
@@ -78,7 +78,7 @@ class BlockchainConnector:
         return selected_node
 
     def switch_to_backup_node(self):
-        """Switch to a different working node, avoiding the current one."""
+        """Switch to a different working node, avoiding the current one."""        
         backup_nodes = [node for node in self.nodes if node != self.working_node]
         random.shuffle(backup_nodes)  # Randomize the order of backup nodes
         working_backup_nodes = []
@@ -99,7 +99,7 @@ class BlockchainConnector:
         return True
 
     def get_account_history(self, account_name, max_retries=3, delay=1):
-        """Get account history with retry logic for node failures and node switching."""
+        """Get account history with retry logic for node failures and node switching."""        
         # Create a list of all available nodes except current one
         available_nodes = [node for node in self.nodes if node != self.working_node]
         # Add current node at the beginning
@@ -167,4 +167,141 @@ class BlockchainConnector:
 
         account = Account(voter, blockchain_instance=self.blockchain)
         comment = Comment(authorperm=f"@{voted}/{permlink}", blockchain_instance=self.blockchain)
-        comment.vote(weight, account=account)
+        comment.vote(weight, account=account)    
+    
+    def get_reward_fund(self, fund_name="post"):
+        """Get reward fund information directly from the blockchain.
+        
+        Args:
+            fund_name (str): Name of the reward fund, typically "post"
+            
+        Returns:
+            dict: Reward fund data with relevant information
+        """
+        try:
+            headers = {'Content-Type': 'application/json'}
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "condenser_api.get_reward_fund",
+                "params": [fund_name],
+                "id": 1
+            }
+            
+            response = requests.post(self.working_node, json=payload, headers=headers, timeout=5)
+            
+            if response.status_code == 200:
+                result = response.json()
+                if 'result' in result:
+                    # Convert amounts to a more usable format
+                    reward_data = result['result']
+                    return reward_data
+                    
+            logger.warning(f"Failed to get reward fund data from {self.working_node}")
+            self.switch_to_backup_node()
+            return self.get_reward_fund(fund_name)  # Try again with new node
+            
+        except Exception as e:
+            logger.error(f"Error getting reward fund: {str(e)}")
+            self.switch_to_backup_node()
+            return self.get_reward_fund(fund_name)  # Try again with new node
+    
+    def get_current_median_history_price(self):
+        """Get the current median price history from the blockchain.
+        
+        Returns:
+            dict: Price data with base and quote values
+        """
+        try:
+            headers = {'Content-Type': 'application/json'}
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "condenser_api.get_current_median_history_price",
+                "params": [],
+                "id": 1
+            }
+            
+            response = requests.post(self.working_node, json=payload, headers=headers, timeout=5)
+            
+            if response.status_code == 200:
+                result = response.json()
+                if 'result' in result:
+                    # Parse price data into a usable format
+                    price_data = result['result']
+                    
+                    # Convert price strings to structured data
+                    base_parts = price_data['base'].split(' ')
+                    quote_parts = price_data['quote'].split(' ')
+                    
+                    return {
+                        'base': {
+                            'amount': float(base_parts[0]),
+                            'symbol': base_parts[1]
+                        },
+                        'quote': {
+                            'amount': float(quote_parts[0]),
+                            'symbol': quote_parts[1]
+                        }
+                    }
+                    
+            logger.warning(f"Failed to get price data from {self.working_node}")
+            self.switch_to_backup_node()
+            return self.get_current_median_history_price()  # Try again with new node
+            
+        except Exception as e:
+            logger.error(f"Error getting current median history price: {str(e)}")
+            self.switch_to_backup_node()
+            return self.get_current_median_history_price()  # Try again with new node
+
+    def get_dynamic_global_properties(self):
+        """Get dynamic global properties from the blockchain.
+        
+        Returns:
+            dict: Global properties data
+        """
+        try:
+            headers = {'Content-Type': 'application/json'}
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "condenser_api.get_dynamic_global_properties",
+                "params": [],
+                "id": 1
+            }
+            
+            response = requests.post(self.working_node, json=payload, headers=headers, timeout=5)
+            
+            if response.status_code == 200:
+                result = response.json()
+                if 'result' in result:
+                    props = result['result']
+                    
+                    # Parse vesting fund and shares to structured data
+                    if 'total_vesting_fund_steem' in props:
+                        fund_parts = props['total_vesting_fund_steem'].split(' ')
+                        props['total_vesting_fund_steem'] = {
+                            'amount': float(fund_parts[0]),
+                            'symbol': fund_parts[1]
+                        }
+                    elif 'total_vesting_fund_hive' in props:
+                        fund_parts = props['total_vesting_fund_hive'].split(' ')
+                        props['total_vesting_fund_steem'] = {  # Use the same key for compatibility
+                            'amount': float(fund_parts[0]),
+                            'symbol': fund_parts[1]
+                        }
+                        
+                    if 'total_vesting_shares' in props:
+                        shares_parts = props['total_vesting_shares'].split(' ')
+                        props['total_vesting_shares'] = {
+                            'amount': float(shares_parts[0]),
+                            'symbol': shares_parts[1]
+                        }
+                        
+                    return props
+                    
+            logger.warning(f"Failed to get global properties from {self.working_node}")
+            self.switch_to_backup_node()
+            return self.get_dynamic_global_properties()  # Try again with new node
+            
+        except Exception as e:
+            logger.error(f"Error getting dynamic global properties: {str(e)}")
+            self.switch_to_backup_node()
+            return self.get_dynamic_global_properties()  # Try again with new node
