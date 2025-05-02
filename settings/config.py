@@ -8,6 +8,9 @@ log_level = "INFO"
 
 log_file_path = "log.txt"
 
+# Test configuration
+TEST_MODE = True  # When True, votes will be simulated but not actually cast on the blockchain
+
 # Node configurations
 STEEM_NODES = [
     "https://api.steemit.com",

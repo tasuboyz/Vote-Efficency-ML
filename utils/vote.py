@@ -106,3 +106,67 @@ def calculate_vote_value_sync(blockchain, vote_percent, effective_vests=None, vo
         return result
     finally:
         loop.close()
+
+def calculate_optimal_weight_by_power(curator_steem_value, important_voters_data, base_weight=100):
+    """
+    Calcola il peso ottimale del voto in base al rapporto tra il valore del proprio voto
+    e il valore stimato dei voti dei whale.
+    
+    Args:
+        curator_steem_value (float): Valore stimato del proprio voto al 100% in STEEM
+        important_voters_data (list): Lista di dati sui votanti importanti con la loro importanza
+        base_weight (int): Peso di voto base proposto (0-100%)
+        
+    Returns:
+        int: Peso di voto ottimizzato (0-100%)
+    """
+    if not important_voters_data or curator_steem_value <= 0:
+        return base_weight
+    
+    # Ordina i votanti importanti per importanza (descendente)
+    top_voters = sorted(important_voters_data, key=lambda x: x.get('importance', 0), reverse=True)
+    
+    # Prendi i top 3 votanti più importanti, se disponibili
+    top_voters = top_voters[:min(3, len(top_voters))]
+    
+    # Stima il valore medio dei voti dei whale
+    # L'importanza è già normalizzata: rshares / 1e12 o vests / 1e6
+    whale_powers = [v.get('importance', 0) * 1e6 for v in top_voters]
+    avg_whale_power = sum(whale_powers) / len(whale_powers) if whale_powers else 0
+    
+    # Converte il potere whale in un valore steem approssimativo
+    # Nota: questa è una stima approssimata, poiché il valore esatto
+    # richiederebbe calcoli più complessi con i parametri della blockchain
+    estimated_whale_vote_value = avg_whale_power * curator_steem_value / 10000  # Stima rough
+    
+    # Calcola il rapporto tra il valore del proprio voto e quello stimato dei whale
+    if estimated_whale_vote_value <= 0:
+        return base_weight
+    
+    power_ratio = curator_steem_value / estimated_whale_vote_value
+    
+    logger.info(f"Rapporto di potenza: {power_ratio:.3f} (tuo voto: {curator_steem_value:.4f} STEEM, " +
+                f"whale stimati: {estimated_whale_vote_value:.4f} STEEM)")
+    
+    # Optimizza il peso del voto in base al rapporto di potenza:
+    # - Se il tuo voto vale oltre il 50% di quello di un whale tipico, riduci il peso
+    if power_ratio >= 0.5:
+        # Formula di riduzione:
+        # - A rapporto 0.5: riduzione al 70%
+        # - A rapporto 0.75: riduzione al 50% 
+        # - A rapporto 1.0 o superiore: riduzione al 30%
+        if power_ratio >= 1.0:
+            reduction_factor = 0.3  # Riduzione massima al 30%
+        elif power_ratio >= 0.75:
+            reduction_factor = 0.5  # Riduzione intermedia al 50%
+        else:  # power_ratio >= 0.5
+            reduction_factor = 0.7  # Riduzione minima al 70%
+            
+        optimized_weight = int(base_weight * reduction_factor)
+        logger.info(f"Peso voto ridotto da {base_weight}% a {optimized_weight}% " +
+                   f"(rapporto di potenza: {power_ratio:.2f})")
+        
+        return optimized_weight
+    
+    # Se il tuo voto è molto più piccolo dei whale, mantieni il peso originale
+    return base_weight

@@ -8,7 +8,8 @@ from collections import defaultdict
 from settings.logging_config import logger
 from settings.config import (
     BLOCKCHAIN_CHOICE, STEEM_NODES, HIVE_NODES, 
-    CURATOR, MODE_CHOICES, OPERATION_MODE, steem_domain, hive_domain
+    CURATOR, MODE_CHOICES, OPERATION_MODE, steem_domain, hive_domain,
+    TEST_MODE
 )
 from utils.beem_requests import BlockchainConnector
 from database.db_manager import DatabaseManager
@@ -38,6 +39,28 @@ class VoteSniper:
         # Initialize tracking
         self.last_check_time = defaultdict(lambda: datetime.now(timezone.utc))
         self.published_posts = set()
+        
+        # Mostra avviso se in modalità test
+        if TEST_MODE:
+            test_mode_message = (
+                "\n" + "=" * 80 + "\n" +
+                "MODALITÀ TEST ATTIVA: I voti verranno simulati ma non inviati alla blockchain\n" +
+                "=" * 80 + "\n"
+            )
+            logger.warning(test_mode_message)
+            print(test_mode_message)
+            
+            # Invia notifica Telegram se configurato
+            try:
+                self.send_telegram_message(
+                    self.TOKEN, 
+                    self.admin_id, 
+                    "⚠️ <b>AVVISO: MODALITÀ TEST ATTIVA</b>\n\n" +
+                    "Il sistema è in esecuzione in modalità di test.\n" +
+                    "I voti verranno analizzati e simulati ma non saranno inviati alla blockchain."
+                )
+            except Exception:
+                pass  # Ignora errori nell'invio della notifica Telegram
 
     def get_posts(self, usernames, platform, max_age_minutes=5):
         """Get recent posts for monitored users."""
@@ -394,48 +417,86 @@ class VoteSniper:
         # Valori di riferimento per i limiti di tempo critici
         MIN_FULL_WEIGHT_AGE = 5.0  # Età minima per peso voto 100%
         CRITICAL_TIMING = 4.8      # Votanti importanti sotto questo valore richiedono decisioni critiche
+        ANTICIPATION_MARGIN = 0.5  # Margine di anticipo rispetto ai votanti importanti (minuti)
         
         # Caso 1: Il post ha già più di 5 minuti, possiamo votare con peso pieno
         if post_age_minutes >= MIN_FULL_WEIGHT_AGE:
             return 100, 0, "Voto con peso pieno (post > 5 min)"
             
-        # Caso 2: Post giovane ma non ci sono votanti importanti imminenti
-        if not important_voters_delay or important_voters_delay > MIN_FULL_WEIGHT_AGE + 1:
+        # Caso 2: Post giovane senza votanti importanti imminenti o non ci sono informazioni sui votanti
+        if not important_voters_delay:
             remaining = MIN_FULL_WEIGHT_AGE - post_age_minutes
-            return 0, remaining, f"Attendo {remaining:.1f} minuti per evitare penalità"
+            return 0, remaining, f"Attendo {remaining:.1f} minuti per raggiungere i 5 minuti (peso pieno)"
             
-        # Caso 3: Votanti importanti arrivano molto presto (prima o appena dopo 5 min)
-        # Questo è il caso critico che richiede compromessi
-        if important_voters_delay <= MIN_FULL_WEIGHT_AGE + 1:
-            # Se i votanti importanti votano prima dei 5 minuti, dobbiamo fare un compromesso
-            if important_voters_delay < MIN_FULL_WEIGHT_AGE:
-                # I votanti importanti arriveranno prima dei 5 minuti
-                if post_age_minutes < CRITICAL_TIMING:
-                    # Votanti imminenti ma post ancora giovane: soluzione di compromesso
-                    # Calcola un peso ridotto per mitigare la penalità ma ottenere comunque curation
-                    time_ratio = post_age_minutes / MIN_FULL_WEIGHT_AGE  # 0-1
-                    # Peso voto progressivo: 50% a 4.5 min, 70% a 4.8 min
-                    scaled_weight = int(50 + (time_ratio * 50))
-                    return min(scaled_weight, 90), 0, f"Voto anticipato con peso ridotto al {scaled_weight}% (compromesso)"
-                else:
-                    # Siamo quasi a 5 minuti ma i votanti importanti stanno per arrivare
-                    # Meglio votare subito con un peso leggermente ridotto
-                    return 90, 0, "Voto quasi al limite dei 5 min con peso 90%"
-            else:
-                # I votanti importanti arriveranno appena dopo i 5 minuti
-                if post_age_minutes >= CRITICAL_TIMING:
-                    # Se siamo vicini ai 5 minuti, attendiamo ancora un po'
-                    remaining = MIN_FULL_WEIGHT_AGE - post_age_minutes
-                    return 0, remaining, f"Attendo solo {remaining:.1f} minuti per votare al 100%"
-                else:
-                    # Applichiamo un peso ridotto in proporzione al tempo mancante
-                    time_ratio = post_age_minutes / MIN_FULL_WEIGHT_AGE
-                    scaled_weight = int(70 + (time_ratio * 30))
-                    return scaled_weight, 0, f"Voto anticipato con peso {scaled_weight}% (compromesso)"
+        # Caso 3: Abbiamo informazioni sui votanti importanti
+        # Calcola quanto tempo manca all'arrivo dei votanti importanti
+        time_until_important = max(0, important_voters_delay - post_age_minutes)
         
-        # Caso predefinito: attendi fino ai 5 minuti
+        # Se i votanti importanti arriveranno dopo i 5 minuti
+        if important_voters_delay > MIN_FULL_WEIGHT_AGE:
+            # Verifichiamo se conviene aspettare i 5 minuti o fino a poco prima dell'arrivo dei votanti
+            time_until_full_weight = MIN_FULL_WEIGHT_AGE - post_age_minutes
+            
+            # Se manca poco ai 5 minuti, è meglio aspettare per votare con peso pieno
+            if time_until_full_weight <= 2.0:
+                return 0, time_until_full_weight, f"Attendo solo {time_until_full_weight:.1f} minuti per votare con peso pieno"
+                
+            # Se manca tanto ai 5 minuti ma i votanti arrivano subito dopo, 
+            # aspetta comunque fino ai 5 minuti per votare a peso pieno
+            if important_voters_delay - MIN_FULL_WEIGHT_AGE < 1.5:
+                return 0, time_until_full_weight, f"Attendo {time_until_full_weight:.1f} minuti per votare con peso pieno (votanti attesi poco dopo)"
+                
+            # Se i votanti arrivano significativamente dopo i 5 minuti,
+            # vota poco prima del loro arrivo previsto
+            target_wait = max(time_until_full_weight, time_until_important - ANTICIPATION_MARGIN)
+            return 0, target_wait, f"Attendo {target_wait:.1f} minuti per votare poco prima dei votanti importanti (previsti a {important_voters_delay:.1f} min)"
+            
+        # Caso 4: I votanti importanti arriveranno prima dei 5 minuti
+        else:
+            # Se il post è già quasi ai 5 minuti, meglio votare con peso ridotto
+            if post_age_minutes >= CRITICAL_TIMING:
+                return 90, 0, f"Voto subito con peso 90% (quasi ai 5 min, votanti previsti a {important_voters_delay:.1f} min)"
+                
+            # Se i votanti sono imminenti (entro 1 minuto)
+            if time_until_important <= 1.0:
+                # Vota subito con peso proporzionale all'età del post
+                time_ratio = post_age_minutes / MIN_FULL_WEIGHT_AGE
+                weight = int(60 + (time_ratio * 30))  # 60-90% dipendendo dall'età
+                return weight, 0, f"Voto immediato con peso {weight}% (votanti imminenti a {important_voters_delay:.1f} min)"
+                
+            # Se c'è ancora tempo prima dell'arrivo dei votanti importanti
+            # aspetta finché non sono quasi arrivati
+            wait_time = max(0, time_until_important - ANTICIPATION_MARGIN)
+            
+            # Se dopo l'attesa il post avrà superato i 5 minuti, aspetta solo fino ai 5 minuti
+            expected_age_after_wait = post_age_minutes + wait_time
+            if expected_age_after_wait >= MIN_FULL_WEIGHT_AGE:
+                wait_time = max(0, MIN_FULL_WEIGHT_AGE - post_age_minutes)
+                return 0, wait_time, f"Attendo {wait_time:.1f} minuti per votare con peso pieno"
+            
+            # Altrimenti, aspetta fino a poco prima dell'arrivo dei votanti
+            return 0, wait_time, f"Attendo {wait_time:.1f} minuti per votare poco prima dei votanti importanti (previsti a {important_voters_delay:.1f} min)"
+        
+        # Caso predefinito (non dovrebbe mai arrivare qui)
         remaining = MIN_FULL_WEIGHT_AGE - post_age_minutes
         return 0, remaining, f"Attendo {remaining:.1f} minuti per peso voto ottimale"
+
+    def _optimize_vote_weight_by_voting_power(self, vote_weight, voting_power):
+        """
+        Ottimizza il peso del voto in base alla potenza di voto.
+        
+        Args:
+            vote_weight: Peso del voto calcolato
+            voting_power: Potenza di voto attuale
+        
+        Returns:
+            Peso del voto ottimizzato
+        """
+        if voting_power > 95:
+            return max(vote_weight - 10, 0)  # Riduci il peso del voto di 10% se VP > 95%
+        elif voting_power > 90:
+            return max(vote_weight - 5, 0)  # Riduci il peso del voto di 5% se VP > 90%
+        return vote_weight
 
     def process_votes(self):
         """Main loop for monitoring and voting on posts."""
@@ -516,6 +577,48 @@ class VoteSniper:
                     optimal_delay, 
                     important_voters_delay
                 )
+                
+                # Ottimizza il peso del voto in base alla potenza di voto
+                original_weight = vote_weight
+                vote_weight = self._optimize_vote_weight_by_voting_power(vote_weight, voting_power)
+                
+                # Aggiorna il messaggio di decisione se il peso è stato cambiato
+                if vote_weight != original_weight and vote_weight > 0:
+                    decision_reason += f" (peso ridotto da {original_weight}% a {vote_weight}% per VP alto)"
+                
+                # Ottimizza ulteriormente il peso in base al valore Steem Power rispetto ai whale
+                if vote_weight > 0 and 'important_voters' in post and post['important_voters']:
+                    try:
+                        from utils.vote import calculate_optimal_weight_by_power
+                        
+                        # Ottieni il valore stimato del tuo voto al 100%
+                        curator = self.steem_curator if platform == "STEEM" else self.hive_curator
+                        curator_account = self.beem.get_account_info(curator)
+                        
+                        # Calcola il valore del voto a peso pieno
+                        vote_value_result = self.beem.calculate_vote_value(
+                            curator=curator,
+                            weight=10000,  # Peso pieno per il calcolo
+                            voting_power=voting_power
+                        )
+                        
+                        steem_value = vote_value_result.get('steem_value', 0)
+                        
+                        if steem_value > 0:
+                            # Ottieni il peso ottimale basato sul rapporto con i whale
+                            original_sp_weight = vote_weight
+                            vote_weight = calculate_optimal_weight_by_power(
+                                curator_steem_value=steem_value,
+                                important_voters_data=post['important_voters'],
+                                base_weight=vote_weight
+                            )
+                            
+                            # Aggiorna il messaggio se il peso è cambiato
+                            if vote_weight != original_sp_weight:
+                                decision_reason += f" (peso ulteriormente ottimizzato a {vote_weight}% per bilanciare con i whale)"
+                                logger.info(f"Peso voto ottimizzato per SP: {original_sp_weight}% → {vote_weight}%")
+                    except Exception as e:
+                        logger.warning(f"Errore nell'ottimizzare il peso per SP: {e}")
                 
                 # Prepara informazioni sui votanti per la notifica
                 voter_info = ""

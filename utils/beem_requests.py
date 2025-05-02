@@ -173,10 +173,33 @@ class BlockchainConnector:
         return author
     
     def like_steem_post(self, voter, voted, permlink, weight=20):
-
-        account = Account(voter, blockchain_instance=self.blockchain)
-        comment = Comment(authorperm=f"@{voted}/{permlink}", blockchain_instance=self.blockchain)
-        comment.vote(weight, account=account)    
+        """Vota un post sulla blockchain o simula il voto in modalità test.
+        
+        Args:
+            voter (str): Nome dell'account che effettua il voto
+            voted (str): Nome dell'account dell'autore del post
+            permlink (str): Permlink del post
+            weight (int): Peso del voto in percentuale (0-100)
+        
+        Returns:
+            bool: True se il voto è stato eseguito/simulato con successo, False altrimenti
+        """
+        from settings.config import TEST_MODE
+        
+        try:
+            if TEST_MODE:
+                logger.info(f"[MODALITÀ TEST] Simulazione voto: {voter} -> @{voted}/{permlink} con peso {weight}%")
+                return True
+            else:
+                # Voto reale sulla blockchain
+                account = Account(voter, blockchain_instance=self.blockchain)
+                comment = Comment(authorperm=f"@{voted}/{permlink}", blockchain_instance=self.blockchain)
+                comment.vote(weight, account=account)
+                logger.info(f"Voto effettuato: {voter} -> @{voted}/{permlink} con peso {weight}%")
+                return True
+        except Exception as e:
+            logger.error(f"Errore nel voto: {e}")
+            return False
     
     def get_reward_fund(self, fund_name="post"):
         """Get reward fund information directly from the blockchain.
@@ -515,3 +538,42 @@ class BlockchainConnector:
         """Pulisce e salva la cache a fine esecuzione."""
         if self._voters_cache:
             self._save_cache()
+
+    def calculate_vote_value(self, curator, weight=10000, voting_power=10000):
+        """
+        Calcola il valore stimato di un voto.
+        
+        Args:
+            curator (str): Nome dell'account del votante
+            weight (int): Peso del voto (0-10000)
+            voting_power (int): Potenza di voto attuale (0-10000)
+            
+        Returns:
+            dict: Valore stimato del voto in STEEM e SBD
+        """
+        try:
+            from utils.vote import calculate_vote_value_sync
+            
+            # Ottieni i vesting shares del curatore
+            account = self.get_account_info(curator)
+            if not account:
+                raise Exception(f'Unable to get account info for {curator}')
+            
+            # Calcola i vesting shares disponibili
+            account_vests = float(account['vesting_shares'].amount)
+            delegated_out = float(account['delegated_vesting_shares'].amount)
+            received_vests = float(account['received_vesting_shares'].amount)
+            vesting_shares = account_vests - delegated_out + received_vests
+            
+            # Calcola il valore del voto
+            result = calculate_vote_value_sync(
+                self.blockchain, 
+                vote_percent=weight, 
+                effective_vests=vesting_shares,
+                voting_power=voting_power
+            )
+            
+            return result
+        except Exception as e:
+            logger.error(f'Errore nel calcolo del valore del voto: {str(e)}')
+            return {'steem_value': 0, 'sbd_value': 0, 'error': str(e)}
