@@ -292,3 +292,117 @@ class DatabaseManager:
         except sqlite3.Error as e:
             logger.error(f"Error getting authors for {platform}: {e}")
             return []
+
+    def get_recent_voting_history(self, author_name, platform, limit=5):
+        """
+        Ottiene la storia dei voti più recenti per un autore specifico.
+        
+        Args:
+            author_name (str): Nome dell'autore
+            platform (str): Piattaforma (STEEM o HIVE)
+            limit (int): Numero di voti recenti da recuperare
+            
+        Returns:
+            list: Lista di voti recenti con i loro dettagli
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # Ottieni l'author_id
+                cursor.execute('''
+                SELECT author_id FROM authors 
+                WHERE author_name = ? AND platform = ?
+                ''', (author_name, platform))
+                
+                result = cursor.fetchone()
+                if not result:
+                    return []
+                    
+                author_id = result[0]
+                
+                # Ottieni i voti più recenti con il loro timing e efficienza
+                cursor.execute('''
+                SELECT 
+                    vote_delay,
+                    efficiency,
+                    post_url,
+                    voted_at
+                FROM voting_delays
+                WHERE author_id = ?
+                ORDER BY voted_at DESC
+                LIMIT ?
+                ''', (author_id, limit))
+                
+                columns = ['vote_delay', 'efficiency', 'post_url', 'voted_at']
+                votes = []
+                
+                for row in cursor.fetchall():
+                    vote_data = dict(zip(columns, row))
+                    votes.append(vote_data)
+                
+                return votes
+                
+        except sqlite3.Error as e:
+            logger.error(f"Errore nel recupero della storia di voto recente: {e}")
+            return []
+
+    def get_last_optimal_delay(self, author_name, platform):
+        """
+        Ottiene il ritardo di voto ottimale basato solo sull'ultimo post che ha ottenuto una buona efficienza.
+        
+        Args:
+            author_name (str): Nome dell'autore
+            platform (str): Piattaforma (STEEM o HIVE)
+            
+        Returns:
+            int: Ritardo ottimale in minuti o None se non disponibile
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # Ottieni l'author_id
+                cursor.execute('''
+                SELECT author_id FROM authors 
+                WHERE author_name = ? AND platform = ?
+                ''', (author_name, platform))
+                
+                result = cursor.fetchone()
+                if not result:
+                    return None
+                    
+                author_id = result[0]
+                
+                # Ottieni dal database l'efficienza massima per questo autore
+                cursor.execute('''
+                SELECT best_efficiency 
+                FROM aggregated_statistics 
+                WHERE author_id = ?
+                ''', (author_id,))
+                
+                best_result = cursor.fetchone()
+                if not best_result or not best_result[0]:
+                    return None
+                
+                best_efficiency = best_result[0]
+                threshold = best_efficiency * 0.7  # Considera voti con efficienza al 70% del massimo
+                
+                # Ottieni il voto più recente che ha raggiunto almeno il 70% della migliore efficienza
+                cursor.execute('''
+                SELECT vote_delay
+                FROM voting_delays
+                WHERE author_id = ? AND efficiency >= ?
+                ORDER BY voted_at DESC
+                LIMIT 1
+                ''', (author_id, threshold))
+                
+                delay_result = cursor.fetchone()
+                if delay_result:
+                    return delay_result[0]
+                
+                return None
+                
+        except sqlite3.Error as e:
+            logger.error(f"Errore nel recupero dell'ultimo ritardo ottimale: {e}")
+            return None

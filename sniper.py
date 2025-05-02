@@ -49,7 +49,6 @@ class VoteSniper:
             try:
                 post = self.beem.get_author_post(username, platform)
                 
-                created_time = post['created']
                 created_time = datetime.strptime(post['created'], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc)
                 
                 post_age = current_time - created_time
@@ -59,6 +58,17 @@ class VoteSniper:
                     # Get post features and optimal delay for prediction
                     author_stats = self.db.get_author_stats(username, platform)
                     optimal_delay = self.db.get_optimal_delay(username, platform)
+                    
+                    # Usiamo la nuova analisi dei voti recenti per questo autore
+                    recent_optimal = self._analyze_recent_voting_patterns(username, platform)
+                    if recent_optimal:
+                        logger.info(f"Utilizzando ritardo ottimale basato sui voti recenti: {recent_optimal} minuti")
+                        
+                        # Aggiorniamo il delay ottimale con i dati recenti
+                        if optimal_delay:
+                            # Diamo più peso (60%) all'analisi recente rispetto al valore storico (40%)
+                            optimal_delay['recent_good_delay'] = round(recent_optimal * 0.6 + optimal_delay['recent_good_delay'] * 0.4)
+                            logger.info(f"Delay finale dopo bilanciamento con dati storici: {optimal_delay['recent_good_delay']} minuti")
                     
                     # Per i post nuovi, non ci saranno votanti importanti immediatamente
                     # Utilizziamo i dati storici e il modello predittivo
@@ -71,7 +81,7 @@ class VoteSniper:
                         important_voters = self.beem.get_post_voters(post['url'], min_importance=1.0)
                         
                         if important_voters:
-                            logger.info(f"Sorprendentemente, trovati {len(important_voters)} votanti importanti su un post nuovo: {post['url']}")
+                            logger.info(f"Trovati {len(important_voters)} votanti importanti su un post nuovo: {post['url']}")
                             voting_window = self._calculate_optimal_voting_window(important_voters)
                             
                             if voting_window:
@@ -80,8 +90,8 @@ class VoteSniper:
                                 
                                 # Usa la finestra di voto ottimale se disponibile
                                 if optimal_delay:
-                                    # Bilanciamo tra l'ottimo storico e la finestra basata sui votanti
-                                    weighted_delay = optimal_delay['recent_good_delay'] * 0.3 + voting_window['optimal_delay'] * 0.7
+                                    # Diamo MOLTO più peso (80%) ai votanti attuali rispetto ai dati storici (20%)
+                                    weighted_delay = optimal_delay['recent_good_delay'] * 0.2 + voting_window['optimal_delay'] * 0.8
                                     optimal_delay['recent_good_delay'] = max(round(weighted_delay), 2)  # Minimo 2 minuti
                         else:
                             logger.info(f"Nessun votante importante trovato per il post nuovo {post['url']} - normale per un post recente")
@@ -92,7 +102,6 @@ class VoteSniper:
                     if use_historical_data and optimal_delay:
                         logger.info(f"Utilizzando dati storici per {post['url']} - Delay ottimale: {optimal_delay['recent_good_delay']} minuti")
                         
-                        # Affiniamo il timing con il modello predittivo
                         # Cerchiamo di identificare i votanti abituali di questo autore
                         try:
                             # Verifica se abbiamo dati storici su quali whale votano questo autore
@@ -105,19 +114,25 @@ class VoteSniper:
                                 logger.info(f"Top votanti abituali per {username}:\n{voter_info}")
                                 
                                 # Calcola un delay ottimale basato sui votanti abituali
+                                # Consideriamo solo i votanti più frequenti (max 5)
                                 avg_delay = sum(v['avg_delay_minutes'] for v in author_frequent_voters[:5]) / min(5, len(author_frequent_voters))
-                                # Imposta un valore minimo e massimo ragionevole
-                                optimal_voting_delay = max(min(avg_delay * 0.8, 30), 5)
+                                # Imposta un valore massimo inferiore a prima (25 invece di 30)
+                                optimal_voting_delay = max(min(avg_delay * 0.8, 25), 5)
                                 logger.info(f"Delay calcolato dai votanti abituali: {optimal_voting_delay:.1f} minuti")
                                 
-                                # Bilanciamo con i dati storici dell'autore
+                                # Diamo più peso ai votanti abituali (60%) rispetto ai dati storici (40%)
                                 if optimal_delay:
-                                    optimal_delay['recent_good_delay'] = round((optimal_delay['recent_good_delay'] + optimal_voting_delay) / 2)
+                                    optimal_delay['recent_good_delay'] = round(optimal_voting_delay * 0.6 + optimal_delay['recent_good_delay'] * 0.4)
                                     logger.info(f"Delay finale bilanciato: {optimal_delay['recent_good_delay']} minuti")
                         except Exception as e:
                             logger.warning(f"Errore nell'analisi dei votanti abituali: {str(e)}")
                     
                     if author_stats and optimal_delay:
+                        # Impostiamo un limite massimo assoluto al delay per evitare di votare troppo tardi
+                        optimal_delay['recent_good_delay'] = min(optimal_delay['recent_good_delay'], 25)
+                        
+                        # Prepariamo le features per il modello di classificazione
+                        # Questo modello decide SE votare in base alle caratteristiche dell'autore
                         features = {
                             'author_avg_efficiency': author_stats['avg_efficiency'],
                             'author_reputation': author_stats['reputation'],
@@ -125,12 +140,15 @@ class VoteSniper:
                             'vote_delay': optimal_delay['recent_good_delay']
                         }
                         
-                        # Make vote decision prediction
+                        # IMPORTANTE: Prima di tutto, il classificatore decide SE votare o meno
                         clf_features = [features[f] for f in ['author_avg_efficiency', 'author_reputation', 'author_avg_payout']]
                         vote_decision = self.clf_model.predict([clf_features])[0]
                         
-                        # If vote decision is positive, predict efficiency
+                        # Solo se il classificatore dice di votare, procediamo con la predizione dell'efficienza
                         if vote_decision == 1:
+                            logger.info(f"Il modello di classificazione ha deciso di votare per {post['url']}")
+                            
+                            # Prediciamo l'efficienza attesa
                             reg_features = [features[f] for f in ['author_avg_efficiency', 'author_reputation', 'author_avg_payout', 'vote_delay']]
                             predicted_efficiency = self.reg_model.predict([reg_features])[0]
                             
@@ -154,13 +172,15 @@ class VoteSniper:
                                 f"Optimal delay: {optimal_delay['recent_good_delay']} minutes\n"
                                 f"Predicted efficiency: {predicted_efficiency:.2f}%"
                             )
+                        else:
+                            logger.info(f"Il modello di classificazione ha deciso di NON votare per {post['url']}")
                         
             except Exception as e:
                 logger.error(f"Error processing posts for {username}: {str(e)}")
                 continue
 
         return post_links
-        
+
     def _get_author_frequent_voters(self, author, platform):
         """Analizza i votanti abituali di un autore in base ai dati storici."""
         try:
@@ -206,31 +226,216 @@ class VoteSniper:
             return []
 
     def _calculate_optimal_voting_window(self, voters):
-        """Calculate optimal voting window based on important voters data."""
+        """
+        Calcola la finestra di voto ottimale basata sui dati dei votanti importanti.
+        Considera sia l'importanza che il timing dei votanti.
+        """
         if not voters:
             return None
             
-        # Sort voters by vote delay (ascending)
-        sorted_voters = sorted(voters, key=lambda x: x['vote_delay_minutes'])
+        # Ordina i votanti per delay (ascendente)
+        sorted_by_timing = sorted(voters, key=lambda x: x['vote_delay_minutes'])
         
-        # Get optimal voting window based on when important voters voted
-        if sorted_voters:
-            # Optimal window is right before the first important voter
-            first_important_voter = sorted_voters[0]
-            voting_window_end = max(first_important_voter['vote_delay_minutes'] - 1, 5)  # 1 minuto prima, ma minimo 5 minuti
-            voting_window_start = max(voting_window_end - 5, 5)  # 5 minuti prima della fine della finestra, ma minimo 5 minuti
-            
-            # Calcola un delay ottimale che è più vicino alla fine della finestra (70% verso end, 30% verso start)
-            # Questo bilancia il vantaggio di essere tra i primi votanti e evitare la penalità di curation
+        # Ordina i votanti per importanza (discendente)
+        sorted_by_importance = sorted(voters, key=lambda x: x['importance'], reverse=True)
+        
+        logger.info(f"Analisi votanti: trovati {len(voters)} votanti importanti")
+        
+        # Mostra i primi 3 votanti per timing e per importanza nei log
+        timing_info = ", ".join([f"{v['voter']} ({v['vote_delay_minutes']} min)" 
+                               for v in sorted_by_timing[:3]])
+        importance_info = ", ".join([f"{v['voter']} (importanza {v['importance']:.1f})" 
+                                  for v in sorted_by_importance[:3]])
+        
+        logger.info(f"Top 3 per timing: {timing_info}")
+        logger.info(f"Top 3 per importanza: {importance_info}")
+        
+        # Prendi i top votanti (primi 5 per importanza)
+        top_important_voters = sorted_by_importance[:5]
+        
+        # Calcola il delay del primo votante per timing
+        first_voter_delay = sorted_by_timing[0]['vote_delay_minutes'] if sorted_by_timing else None
+        
+        # Calcola il delay medio dei top votanti per importanza
+        top_delays = [v['vote_delay_minutes'] for v in top_important_voters]
+        top_importance_min_delay = min(top_delays) if top_delays else None
+        
+        # Strategia avanzata: consideriamo sia il primo votante che i votanti più importanti
+        if first_voter_delay is not None and top_importance_min_delay is not None:
+            # Se il primo votante è lontano dai votanti più importanti, 
+            # potremmo voler bilanciare i due valori
+            if top_importance_min_delay - first_voter_delay > 3:
+                # Il primo votante per importanza arriva molto dopo il primo per timing
+                logger.info(f"Votanti importanti arrivano significativamente dopo ({top_importance_min_delay} min) " +
+                          f"rispetto al primo votante ({first_voter_delay} min)")
+                
+                # Calcola un delay ottimale che bilancia i due valori
+                # Se i top votanti arrivano molto dopo, diamo comunque più peso
+                # al loro timing per massimizzare l'efficienza
+                weight_for_top_important = 0.7  # 70% del peso per i votanti top
+                optimal_raw = (first_voter_delay * (1 - weight_for_top_important) + 
+                             top_importance_min_delay * weight_for_top_important)
+                
+                # Arrotondiamo e assicuriamo che sia almeno 5 minuti
+                optimal_delay = max(round(optimal_raw - 1), 5)  # -1 per anticipare comunque di 1 minuto
+                
+                # Calcoliamo la finestra di voto
+                voting_window_end = optimal_delay
+                voting_window_start = max(voting_window_end - 3, 5)  # 3 minuti prima della fine della finestra, ma minimo 5 minuti
+                
+                logger.info(f"Bilanciamento tra timing e importanza: selezionato delay ottimale di {optimal_delay} minuti")
+            else:
+                # I votanti importanti votano vicino al primo votante
+                # In questo caso, anticipiamo leggermente il primo votante
+                voting_window_end = max(first_voter_delay - 1, 5)  # 1 minuto prima, ma minimo 5 minuti
+                voting_window_start = max(voting_window_end - 3, 5)  # 3 minuti prima della fine della finestra, ma minimo 5 minuti
+                optimal_delay = voting_window_start + (voting_window_end - voting_window_start) * 0.7
+                
+                logger.info(f"Votanti importanti arrivano subito: ottimizzato per anticiparli tutti a {optimal_delay:.1f} minuti")
+        elif first_voter_delay is not None:
+            # Se abbiamo solo il primo votante per timing
+            voting_window_end = max(first_voter_delay - 1, 5)  # 1 minuto prima, ma minimo 5 minuti
+            voting_window_start = max(voting_window_end - 3, 5)  # 3 minuti prima della fine della finestra, ma minimo 5 minuti
             optimal_delay = voting_window_start + (voting_window_end - voting_window_start) * 0.7
-            
-            return {
-                'start': voting_window_start,
-                'end': voting_window_end,
-                'optimal_delay': optimal_delay
-            }
+        else:
+            # Caso improbabile: non abbiamo informazioni sui delay
+            return None
         
-        return None
+        # Log dettagliati sulla strategia di timing
+        logger.info(f"Finestra di voto calcolata: {voting_window_start}-{voting_window_end} minuti")
+        logger.info(f"Delay ottimale raccomandato: {optimal_delay:.1f} minuti")
+        
+        return {
+            'start': voting_window_start,
+            'end': voting_window_end,
+            'optimal_delay': optimal_delay
+        }
+
+    def _analyze_recent_voting_patterns(self, author_name, platform):
+        """
+        Analizza i dati di voto recenti per l'autore con focus sui votanti importanti.
+        L'obiettivo è anticipare specificamente i votanti importanti, non votare genericamente presto.
+        """
+        try:
+            # Otteniamo l'informazione sui votanti frequenti di questo autore
+            frequent_voters = self._get_author_frequent_voters(author_name, platform)
+            
+            # Se abbiamo votanti frequenti importanti, utilizziamo i loro tempi per decidere
+            important_voter_timing = None
+            
+            if frequent_voters:
+                important_voters = [v for v in frequent_voters if v.get('importance', 0) >= 1.0]
+                if important_voters:
+                    # Calcola la media del timing dei votanti importanti
+                    delays = []
+                    for voter in important_voters:
+                        delays.extend(voter['delays'])
+                    
+                    if delays:
+                        # Ordina i delay e prendi il primo quartile (per anticipare la maggior parte dei voti)
+                        delays.sort()
+                        first_quartile_index = max(0, len(delays) // 4 - 1)
+                        important_voter_timing = delays[first_quartile_index]
+                        
+                        # Per sicurezza, anticipa di 1-2 minuti rispetto al timing del primo quartile
+                        important_voter_timing = max(important_voter_timing - 2, 5)
+                        
+                        logger.info(f"📊 Timing basato sui votanti importanti per {author_name}: {important_voter_timing} minuti " +
+                                   f"(anticipato rispetto al primo quartile di {len(delays)} voti storici)")
+                        
+                        # Ritorna immediatamente questo valore se lo abbiamo trovato
+                        return important_voter_timing
+            
+            # Fallback alla strategia precedente se non abbiamo informazioni sui votanti importanti
+            last_optimal = self.db.get_last_optimal_delay(author_name, platform)
+            recent_votes = self.db.get_recent_voting_history(author_name, platform, limit=5)
+            
+            if not recent_votes and not last_optimal:
+                logger.info(f"Nessun dato storico per {author_name}, utilizzando delay predefinito di 10 minuti")
+                return 10
+                
+            total_weight = 0
+            weighted_sum = 0
+            
+            for i, vote in enumerate(recent_votes):
+                weight = (len(recent_votes) - i)**2
+                weighted_sum += vote['vote_delay'] * weight
+                total_weight += weight
+            
+            avg_recent_delay = weighted_sum / total_weight if total_weight > 0 else None
+            
+            base_delay = 10
+            
+            if last_optimal is not None:
+                base_delay = max(round(last_optimal * 0.7), 5)
+                logger.info(f"Utilizzo ultimo ottimale per {author_name} con riduzione: {last_optimal} → {base_delay}")
+            elif avg_recent_delay is not None:
+                base_delay = max(round(avg_recent_delay * 0.7), 5)
+                logger.info(f"Utilizzo media recente per {author_name} con riduzione: {avg_recent_delay:.1f} → {base_delay}")
+            
+            return min(base_delay, 20)
+            
+        except Exception as e:
+            logger.error(f"Errore nell'analisi dei voti recenti per {author_name}: {str(e)}")
+            return 10
+
+    def _calculate_optimal_vote_weight(self, post_age_minutes, target_delay, important_voters_delay=None):
+        """
+        Calcola il peso ottimale del voto in base al timing.
+        
+        Args:
+            post_age_minutes: Età attuale del post in minuti
+            target_delay: Ritardo target ottimale calcolato
+            important_voters_delay: Ritardo medio dei votanti importanti se disponibile
+            
+        Returns:
+            Tuple (peso_voto, delay_consigliato, messaggio)
+        """
+        # Valori di riferimento per i limiti di tempo critici
+        MIN_FULL_WEIGHT_AGE = 5.0  # Età minima per peso voto 100%
+        CRITICAL_TIMING = 4.8      # Votanti importanti sotto questo valore richiedono decisioni critiche
+        
+        # Caso 1: Il post ha già più di 5 minuti, possiamo votare con peso pieno
+        if post_age_minutes >= MIN_FULL_WEIGHT_AGE:
+            return 100, 0, "Voto con peso pieno (post > 5 min)"
+            
+        # Caso 2: Post giovane ma non ci sono votanti importanti imminenti
+        if not important_voters_delay or important_voters_delay > MIN_FULL_WEIGHT_AGE + 1:
+            remaining = MIN_FULL_WEIGHT_AGE - post_age_minutes
+            return 0, remaining, f"Attendo {remaining:.1f} minuti per evitare penalità"
+            
+        # Caso 3: Votanti importanti arrivano molto presto (prima o appena dopo 5 min)
+        # Questo è il caso critico che richiede compromessi
+        if important_voters_delay <= MIN_FULL_WEIGHT_AGE + 1:
+            # Se i votanti importanti votano prima dei 5 minuti, dobbiamo fare un compromesso
+            if important_voters_delay < MIN_FULL_WEIGHT_AGE:
+                # I votanti importanti arriveranno prima dei 5 minuti
+                if post_age_minutes < CRITICAL_TIMING:
+                    # Votanti imminenti ma post ancora giovane: soluzione di compromesso
+                    # Calcola un peso ridotto per mitigare la penalità ma ottenere comunque curation
+                    time_ratio = post_age_minutes / MIN_FULL_WEIGHT_AGE  # 0-1
+                    # Peso voto progressivo: 50% a 4.5 min, 70% a 4.8 min
+                    scaled_weight = int(50 + (time_ratio * 50))
+                    return min(scaled_weight, 90), 0, f"Voto anticipato con peso ridotto al {scaled_weight}% (compromesso)"
+                else:
+                    # Siamo quasi a 5 minuti ma i votanti importanti stanno per arrivare
+                    # Meglio votare subito con un peso leggermente ridotto
+                    return 90, 0, "Voto quasi al limite dei 5 min con peso 90%"
+            else:
+                # I votanti importanti arriveranno appena dopo i 5 minuti
+                if post_age_minutes >= CRITICAL_TIMING:
+                    # Se siamo vicini ai 5 minuti, attendiamo ancora un po'
+                    remaining = MIN_FULL_WEIGHT_AGE - post_age_minutes
+                    return 0, remaining, f"Attendo solo {remaining:.1f} minuti per votare al 100%"
+                else:
+                    # Applichiamo un peso ridotto in proporzione al tempo mancante
+                    time_ratio = post_age_minutes / MIN_FULL_WEIGHT_AGE
+                    scaled_weight = int(70 + (time_ratio * 30))
+                    return scaled_weight, 0, f"Voto anticipato con peso {scaled_weight}% (compromesso)"
+        
+        # Caso predefinito: attendi fino ai 5 minuti
+        remaining = MIN_FULL_WEIGHT_AGE - post_age_minutes
+        return 0, remaining, f"Attendo {remaining:.1f} minuti per peso voto ottimale"
 
     def process_votes(self):
         """Main loop for monitoring and voting on posts."""
@@ -287,87 +492,173 @@ class VoteSniper:
                 time_until_vote = target_vote_time - datetime.now(timezone.utc)
                 minutes_until_vote = time_until_vote.total_seconds() / 60
                 
-                # Prepara informazioni sui votanti importanti per la notifica
+                # Calcola l'età attuale del post
+                current_age_minutes = (datetime.now(timezone.utc) - created_time).total_seconds() / 60
+                
+                # Analizza i votanti importanti
+                important_voters_delay = None
+                if 'frequent_voters' in post and post['frequent_voters']:
+                    important_voters = [v for v in post['frequent_voters'] if v.get('importance', 0) >= 1.0]
+                    if important_voters:
+                        # Calcola la media dei tempi dei votanti importanti
+                        delays = []
+                        for voter in important_voters:
+                            if 'avg_delay_minutes' in voter:
+                                delays.append(voter['avg_delay_minutes'])
+                        
+                        if delays:
+                            # Utilizziamo il valore più basso per essere più aggressivi
+                            important_voters_delay = min(delays)
+                
+                # Calcola il peso del voto ottimale in base al timing
+                vote_weight, wait_minutes, decision_reason = self._calculate_optimal_vote_weight(
+                    current_age_minutes, 
+                    optimal_delay, 
+                    important_voters_delay
+                )
+                
+                # Prepara informazioni sui votanti per la notifica
                 voter_info = ""
+                frequent_voter_info = ""
+                
+                # Aggiunge informazioni sui votanti frequenti e importanti dell'autore
+                if 'frequent_voters' in post and post['frequent_voters']:
+                    important_frequent = [v for v in post['frequent_voters'] if v.get('importance', 0) >= 1.0]
+                    if important_frequent:
+                        frequent_voter_info = "\n\nVotanti importanti abituali:\n"
+                        for v in important_frequent[:3]:
+                            avg_delay = v['avg_delay_minutes']
+                            frequent_voter_info += f"- {v['voter']} ({v['vote_count']} voti, arrivo previsto: {avg_delay:.1f} min)\n"
+                
+                # Aggiunge informazioni sui votanti attuali se presenti
                 if 'important_voters' in post and post['important_voters']:
-                    # Ottieni i top 3 votanti per importanza
                     top_voters = sorted(post['important_voters'], key=lambda x: x['importance'], reverse=True)[:3]
-                    voter_info = "\n\nTop voters:\n"
+                    voter_info = "\n\nVotanti importanti già presenti:\n"
                     for v in top_voters:
-                        voter_info += f"- {v['voter']} (importance: {v['importance']:.2f}, delay: {v['vote_delay_minutes']} min)\n"
+                        voter_info += f"- {v['voter']} (importanza: {v['importance']:.2f}, delay: {v['vote_delay_minutes']} min)\n"
+                
+                weight_info = f"\nPeso voto: {vote_weight}%" if vote_weight > 0 else ""
+                timing_info = f"\nAttesa: {wait_minutes:.1f} minuti" if wait_minutes > 0 else "\nVoto immediato"
                 
                 message = (
-                    f"[{platform}] Found voteable post!\n"
+                    f"[{platform}] 🔍 Trovato post votabile!\n"
                     f"Author: {post['author']}\n"
                     f"VP: {voting_power}%\n"
                     f"URL: {url}\n"
-                    f"Optimal delay: {optimal_delay} minutes\n"
-                    f"Predicted efficiency: {post['predicted_efficiency']:.2f}%\n"
-                    f"Best historical: {post['best_historical_efficiency']:.2f}%\n"
-                    f"Voting in: {minutes_until_vote:.1f} minutes"
+                    f"Età attuale: {current_age_minutes:.1f} minuti\n"
+                    f"Ritardo ottimale: {optimal_delay} minuti\n"
+                    f"Efficienza prevista: {post['predicted_efficiency']:.2f}%\n"
+                    f"Decisione: {decision_reason}{weight_info}{timing_info}"
                     f"{voter_info}"
+                    f"{frequent_voter_info}"
                 )
                 self.send_telegram_message(self.TOKEN, self.admin_id, message)
                 
                 if voting_power > 89:
-                    if minutes_until_vote > 0:
-                        logger.info(f"Waiting {minutes_until_vote:.1f} minutes before voting...")
-                        time.sleep(minutes_until_vote * 60)
-                    
-                    # Verifica nuovamente che non ci sia stato un voto importante nel frattempo
-                    if minutes_until_vote > 2:  # Solo se stiamo aspettando più di 2 minuti
-                        try:
-                            current_voters = self.beem.get_post_voters(post['url'], min_importance=1.0, use_cache=False)
-                            updated_window = self._calculate_optimal_voting_window(current_voters)
-                            if updated_window:
-                                new_optimal_delay = updated_window['optimal_delay']
-                                # Se il nuovo ritardo ottimale è significativamente diverso, aggiustiamo
-                                if abs(new_optimal_delay - optimal_delay) > 2:
-                                    logger.info(f"Important voter detected during waiting! Adjusting vote timing.")
-                                    adjusted_msg = f"⚠️ Vote timing adjusted based on new important voters. Voting now!"
-                                    self.send_telegram_message(self.TOKEN, self.admin_id, adjusted_msg)
-                                    # Votiamo subito se è passato il tempo minimo
-                                    if (datetime.now(timezone.utc) - created_time).total_seconds() / 60 >= 5:
-                                        break
-                        except Exception as recheck_error:
-                            logger.warning(f"Failed to recheck voters: {str(recheck_error)}")
-                    
-                    permlink = self.beem.get_permlink(url)
-                    self.beem.like_steem_post(
-                        voter=curator,
-                        voted=post['author'],
-                        permlink=permlink,
-                        weight=100
-                    )
-                    
-                    # Registra questa votazione nel database per migliorare le future previsioni
-                    try:
-                        actual_delay = (datetime.now(timezone.utc) - created_time).total_seconds() / 60
-                        logger.info(f"Voted on {url} after {actual_delay:.1f} minutes delay (target was {optimal_delay})")
+                    # Se dobbiamo aspettare in base alla strategia di peso
+                    if wait_minutes > 0:
+                        logger.info(f"In attesa {wait_minutes:.1f} minuti per ottimizzare il peso del voto...")
                         
-                        # Aggiorna il database con questa votazione per apprendimento futuro
-                        self.db.update_voting_delay(
-                            author_name=post['author'],
-                            platform=platform,
-                            vote_delay=actual_delay,
-                            efficiency=post['predicted_efficiency'],
-                            post_url=post['url']
+                        # Suddividiamo l'attesa in intervalli per monitorare attivamente
+                        wait_seconds = int(wait_minutes * 60)
+                        check_interval = 30  # Verifica ogni 30 secondi (aumentiamo la frequenza)
+                        
+                        created_timestamp = created_time.timestamp()
+                        original_voters = post['important_voters'] if 'important_voters' in post else []
+                        original_voter_names = {v['voter'] for v in original_voters}
+                        
+                        for i in range(0, wait_seconds, check_interval):
+                            time_to_wait = min(check_interval, wait_seconds - i)
+                            if time_to_wait <= 0:
+                                break
+                                
+                            time.sleep(time_to_wait)
+                            
+                            # Ricalcola l'età attuale e il peso ottimale
+                            current_age = (datetime.now(timezone.utc).timestamp() - created_timestamp) / 60
+                            new_weight, _, new_reason = self._calculate_optimal_vote_weight(
+                                current_age, optimal_delay, important_voters_delay
+                            )
+                            
+                            # Verifica se siamo pronti a votare
+                            if new_weight > 0:
+                                logger.info(f"Condizioni cambiate! Possiamo votare con peso {new_weight}%: {new_reason}")
+                                vote_weight = new_weight
+                                break
+                                
+                            # Verifica se sono arrivati nuovi votanti importanti
+                            try:
+                                current_voters = self.beem.get_post_voters(post['url'], min_importance=1.0, use_cache=False)
+                                
+                                # Se ci sono nuovi votanti importanti, votiamo immediatamente
+                                if current_voters:
+                                    current_voter_names = {v['voter'] for v in current_voters}
+                                    new_voters = current_voter_names - original_voter_names
+                                    
+                                    if new_voters:
+                                        logger.info(f"⚠️ Rilevati nuovi votanti importanti: {', '.join(new_voters)}!")
+                                        alert_msg = f"⚠️ ATTENZIONE! Nuovi votanti importanti: {', '.join(new_voters)}"
+                                        self.send_telegram_message(self.TOKEN, self.admin_id, alert_msg)
+                                        
+                                        # Se il post ha almeno 4.5 minuti, votiamo con peso ridotto
+                                        if current_age >= 4.5:
+                                            vote_weight = max(70, int(current_age / 5 * 100))
+                                            break
+                                        # Altrimenti incrementiamo l'attesa ma aumentiamo la frequenza di check
+                                        else:
+                                            check_interval = 10  # Check ogni 10 secondi
+                            except Exception as e:
+                                logger.warning(f"Errore nel monitoraggio votanti: {str(e)}")
+                    
+                    # Votiamo con il peso calcolato
+                    if vote_weight > 0:
+                        permlink = self.beem.get_permlink(url)
+                        logger.info(f"Voto su {url} con peso {vote_weight}%")
+                        
+                        # Notifica che stiamo per votare
+                        notification = f"🗳️ Voto su {url}\nPeso: {vote_weight}%"
+                        self.send_telegram_message(self.TOKEN, self.admin_id, notification)
+                        
+                        # Esegui il voto
+                        self.beem.like_steem_post(
+                            voter=curator,
+                            voted=post['author'],
+                            permlink=permlink,
+                            weight=vote_weight
                         )
                         
-                        # Notifica del voto completato con successo
-                        success_msg = f"✅ Vote on {url} successful!\nActual delay: {actual_delay:.1f} min"
-                        self.send_telegram_message(self.TOKEN, self.admin_id, success_msg)
-                    except Exception as db_error:
-                        logger.error(f"Failed to update database: {str(db_error)}")
+                        # Registra questa votazione nel database
+                        try:
+                            actual_delay = (datetime.now(timezone.utc) - created_time).total_seconds() / 60
+                            logger.info(f"Votato {url} dopo {actual_delay:.1f} minuti con peso {vote_weight}%")
+                            
+                            # Aggiorna il database (qui l'efficienza sarà proporzionale al peso del voto)
+                            scaled_efficiency = post['predicted_efficiency'] * (vote_weight / 100)
+                            self.db.update_voting_delay(
+                                author_name=post['author'],
+                                platform=platform,
+                                vote_delay=actual_delay,
+                                efficiency=scaled_efficiency,
+                                post_url=post['url']
+                            )
+                            
+                            success_msg = f"✅ Voto su {url} completato!\nRitardo: {actual_delay:.1f} min, Peso: {vote_weight}%"
+                            self.send_telegram_message(self.TOKEN, self.admin_id, success_msg)
+                        except Exception as db_error:
+                            logger.error(f"Errore nell'aggiornamento del database: {db_error}")
+                    else:
+                        logger.info(f"Voto su {url} saltato per strategia di timing")
+                        skip_msg = f"⏭️ Voto su {url} saltato per strategia di timing"
+                        self.send_telegram_message(self.TOKEN, self.admin_id, skip_msg)
                 else:
                     self.send_telegram_message(
                         self.TOKEN, 
                         self.admin_id, 
-                        f"⚠️ VP too low ({voting_power}%), skipping vote"
+                        f"⚠️ VP troppo basso ({voting_power}%), voto saltato"
                     )
                     
             except Exception as e:
-                logger.error(f"Error processing post {post['url']}: {str(e)}")
+                logger.error(f"Errore nell'elaborazione del post {post['url'] if 'url' in post else 'sconosciuto'}: {str(e)}")
                 continue
 
     def send_telegram_message(self, bot_token, chat_id, message):
