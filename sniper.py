@@ -623,20 +623,32 @@ class VoteSniper:
                 # Prepara informazioni sui votanti per la notifica
                 voter_info = ""
                 frequent_voter_info = ""
+                all_frequent_voters_info = ""
                 
                 # Aggiunge informazioni sui votanti frequenti e importanti dell'autore
                 if 'frequent_voters' in post and post['frequent_voters']:
+                    # Prima mostriamo i votanti abituali importanti (whales)
                     important_frequent = [v for v in post['frequent_voters'] if v.get('importance', 0) >= 1.0]
                     if important_frequent:
-                        frequent_voter_info = "\n\nVotanti importanti abituali:\n"
-                        for v in important_frequent[:3]:
+                        frequent_voter_info = "\n\n📊 Votanti importanti abituali:\n"
+                        for v in important_frequent[:5]:  # Mostra fino a 5 votanti importanti
                             avg_delay = v['avg_delay_minutes']
                             frequent_voter_info += f"- {v['voter']} ({v['vote_count']} voti, arrivo previsto: {avg_delay:.1f} min)\n"
+                    
+                    # Poi aggiungiamo una sezione per tutti i votanti abituali
+                    # Ordina per frequenza di voto (discendente)
+                    all_frequent = sorted(post['frequent_voters'], key=lambda x: x['vote_count'], reverse=True)
+                    if all_frequent:
+                        all_frequent_voters_info = "\n\n👥 Elenco completo votanti abituali:\n"
+                        for v in all_frequent[:15]:  # Mostra fino a 15 votanti abituali
+                            avg_delay = v['avg_delay_minutes']
+                            importance_marker = "🐳" if v.get('importance', 0) >= 1.0 else ""
+                            all_frequent_voters_info += f"- {v['voter']}{importance_marker}: {v['vote_count']} voti, media {avg_delay:.1f} min\n"
                 
                 # Aggiunge informazioni sui votanti attuali se presenti
                 if 'important_voters' in post and post['important_voters']:
                     top_voters = sorted(post['important_voters'], key=lambda x: x['importance'], reverse=True)[:3]
-                    voter_info = "\n\nVotanti importanti già presenti:\n"
+                    voter_info = "\n\n🔍 Votanti importanti già presenti:\n"
                     for v in top_voters:
                         voter_info += f"- {v['voter']} (importanza: {v['importance']:.2f}, delay: {v['vote_delay_minutes']} min)\n"
                 
@@ -654,6 +666,7 @@ class VoteSniper:
                     f"Decisione: {decision_reason}{weight_info}{timing_info}"
                     f"{voter_info}"
                     f"{frequent_voter_info}"
+                    f"{all_frequent_voters_info}"
                 )
                 self.send_telegram_message(self.TOKEN, self.admin_id, message)
                 
