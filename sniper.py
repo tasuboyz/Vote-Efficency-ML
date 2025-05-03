@@ -415,9 +415,10 @@ class VoteSniper:
             Tuple (peso_voto, delay_consigliato, messaggio)
         """
         # Valori di riferimento per i limiti di tempo critici
-        MIN_FULL_WEIGHT_AGE = 5.0  # Età minima per peso voto 100%
-        CRITICAL_TIMING = 4.8      # Votanti importanti sotto questo valore richiedono decisioni critiche
-        ANTICIPATION_MARGIN = 0.5  # Margine di anticipo rispetto ai votanti importanti (minuti)
+        MIN_FULL_WEIGHT_AGE = 5.0    # Età minima per peso voto 100%
+        CRITICAL_TIMING = 4.8        # Votanti importanti sotto questo valore richiedono decisioni critiche
+        ANTICIPATION_MARGIN = 1.0    # Margine di anticipo rispetto ai votanti importanti (aumentato a 1.0 minuto)
+        MIN_VOTE_TIME = 2.0          # Tempo minimo di attesa per qualsiasi post (almeno 2 minuti)
         
         # Caso 1: Il post ha già più di 5 minuti, possiamo votare con peso pieno
         if post_age_minutes >= MIN_FULL_WEIGHT_AGE:
@@ -457,29 +458,54 @@ class VoteSniper:
             if post_age_minutes >= CRITICAL_TIMING:
                 return 90, 0, f"Voto subito con peso 90% (quasi ai 5 min, votanti previsti a {important_voters_delay:.1f} min)"
                 
-            # Se i votanti sono imminenti (entro 1 minuto)
-            if time_until_important <= 1.0:
-                # Vota subito con peso proporzionale all'età del post
-                time_ratio = post_age_minutes / MIN_FULL_WEIGHT_AGE
-                weight = int(60 + (time_ratio * 30))  # 60-90% dipendendo dall'età
-                return weight, 0, f"Voto immediato con peso {weight}% (votanti imminenti a {important_voters_delay:.1f} min)"
+            # Se il votante importante è estremamente veloce (sotto 2 minuti)
+            if important_voters_delay <= MIN_VOTE_TIME:
+                # Calcola un tempo di attesa minimo per ottimizzare il peso del voto
+                # Considera l'età attuale del post (potremmo già essere oltre il tempo minimo)
+                if post_age_minutes < MIN_VOTE_TIME:
+                    wait_minutes = MIN_VOTE_TIME - post_age_minutes
+                    return 0, wait_minutes, f"Attendo almeno {wait_minutes:.1f} minuti per ottimizzare il peso (votante veloce a {important_voters_delay:.1f} min)"
+                else:
+                    # Se abbiamo già superato il tempo minimo, calcola un peso in base all'età
+                    time_ratio = post_age_minutes / MIN_FULL_WEIGHT_AGE
+                    weight = int(70 + (time_ratio * 20))  # 70-90% proporzionale all'età
+                    return weight, 0, f"Voto con peso {weight}% (attesa minima superata, votante veloce a {important_voters_delay:.1f} min)"
                 
-            # Se c'è ancora tempo prima dell'arrivo dei votanti importanti
-            # aspetta finché non sono quasi arrivati
-            wait_time = max(0, time_until_important - ANTICIPATION_MARGIN)
-            
-            # Se dopo l'attesa il post avrà superato i 5 minuti, aspetta solo fino ai 5 minuti
-            expected_age_after_wait = post_age_minutes + wait_time
-            if expected_age_after_wait >= MIN_FULL_WEIGHT_AGE:
-                wait_time = max(0, MIN_FULL_WEIGHT_AGE - post_age_minutes)
-                return 0, wait_time, f"Attendo {wait_time:.1f} minuti per votare con peso pieno"
-            
-            # Altrimenti, aspetta fino a poco prima dell'arrivo dei votanti
-            return 0, wait_time, f"Attendo {wait_time:.1f} minuti per votare poco prima dei votanti importanti (previsti a {important_voters_delay:.1f} min)"
+            # Se il votante importante arriva tra 2 e 5 minuti (il caso più comune)
+            else:
+                # Attenzione: votante importante imminente (entro 1.5 minuti dall'età attuale)
+                if time_until_important <= 1.5:
+                    # Se non abbiamo ancora raggiunto il tempo minimo di attesa
+                    if post_age_minutes < MIN_VOTE_TIME:
+                        wait_minutes = MIN_VOTE_TIME - post_age_minutes
+                        return 0, wait_minutes, f"Attendo fino a {MIN_VOTE_TIME:.1f} min prima di votare (votanti a {important_voters_delay:.1f} min)"
+                    
+                    # Vota con un peso proporzionale all'età del post 
+                    # (più vicini ai 5 minuti = peso maggiore)
+                    time_ratio = post_age_minutes / MIN_FULL_WEIGHT_AGE
+                    weight = int(70 + (time_ratio * 20))  # 70-90% proporzionale all'età
+                    return weight, 0, f"Voto subito con peso {weight}% (votanti imminenti a {important_voters_delay:.1f} min)"
+                
+                # Calcola il tempo ottimale di attesa: anticipiamo di ANTICIPATION_MARGIN minuti
+                wait_time = max(0, time_until_important - ANTICIPATION_MARGIN)
+                
+                # Verifica che il tempo di attesa non ci porti oltre i 5 minuti
+                expected_age_after_wait = post_age_minutes + wait_time
+                if expected_age_after_wait >= MIN_FULL_WEIGHT_AGE:
+                    wait_time = max(0, MIN_FULL_WEIGHT_AGE - post_age_minutes)
+                    return 0, wait_time, f"Attendo {wait_time:.1f} minuti per votare con peso pieno"
+                
+                # Verifica che rispettiamo il tempo minimo di attesa
+                if post_age_minutes + wait_time < MIN_VOTE_TIME:
+                    adjusted_wait_time = MIN_VOTE_TIME - post_age_minutes
+                    return 0, adjusted_wait_time, f"Attendo {adjusted_wait_time:.1f} minuti (tempo minimo di attesa)"
+                
+                # Altrimenti, aspetta fino a poco prima dell'arrivo dei votanti
+                return 0, wait_time, f"Attendo {wait_time:.1f} minuti per votare prima dei votanti importanti (previsti a {important_voters_delay:.1f} min)"
         
         # Caso predefinito (non dovrebbe mai arrivare qui)
         remaining = MIN_FULL_WEIGHT_AGE - post_age_minutes
-        return 0, remaining, f"Attendo {remaining:.1f} minuti per peso voto ottimale"
+        return 0, remaining, f"Attendo {remaining:.1f} minuti per ottimizzare il peso del voto"
 
     def _optimize_vote_weight_by_voting_power(self, vote_weight, voting_power):
         """
