@@ -507,21 +507,54 @@ class VoteSniper:
         remaining = MIN_FULL_WEIGHT_AGE - post_age_minutes
         return 0, remaining, f"Attendo {remaining:.1f} minuti per ottimizzare il peso del voto"
 
-    def _optimize_vote_weight_by_voting_power(self, vote_weight, voting_power):
+    def _optimize_vote_weight_by_voting_power(self, vote_weight, voting_power, post=None, platform=None):
         """
-        Ottimizza il peso del voto in base alla potenza di voto.
+        Ottimizza il peso del voto in base alla potenza di voto e al valore STEEM del voto.
         
         Args:
             vote_weight: Peso del voto calcolato
             voting_power: Potenza di voto attuale
+            post: Dati del post (opzionale)
+            platform: Piattaforma (STEEM/HIVE) (opzionale)
         
         Returns:
             Peso del voto ottimizzato
         """
+        # 1. Prima ottimizziamo in base alla potenza di voto (come prima)
         if voting_power > 95:
-            return max(vote_weight - 10, 0)  # Riduci il peso del voto di 10% se VP > 95%
+            vote_weight = max(vote_weight - 10, 0)  # Riduci il peso del voto di 10% se VP > 95%
         elif voting_power > 90:
-            return max(vote_weight - 5, 0)  # Riduci il peso del voto di 5% se VP > 90%
+            vote_weight = max(vote_weight - 5, 0)  # Riduci il peso del voto di 5% se VP > 90%
+        
+        # 2. Se abbiamo informazioni sul post e la piattaforma, ottimizziamo in base al valore STEEM
+        if post and platform and vote_weight > 0:
+            try:
+                from utils.vote import calculate_vote_value_sync, optimize_weight_by_absolute_value
+                
+                # Ottieni il curator attivo
+                curator = self.steem_curator if platform == "STEEM" else self.hive_curator
+                
+                # Calcola il valore del voto a peso 100%
+                vote_value_result = calculate_vote_value_sync(
+                    blockchain=self.beem,  # Passiamo l'istanza di BlockchainConnector
+                    vote_percent=10000,    # 100% (notazione interna della blockchain)
+                    voting_power=voting_power
+                )
+                
+                steem_value = vote_value_result.get("steem_value", 0)
+                logger.info(f"Valore stimato del voto al 100%: {steem_value:.4f} STEEM")
+                
+                # Ottimizza il peso in base al valore assoluto STEEM usando la nuova funzione
+                if steem_value > 0:
+                    original_weight = vote_weight
+                    vote_weight = optimize_weight_by_absolute_value(steem_value, vote_weight)
+                    
+                    if vote_weight != original_weight:
+                        logger.info(f"Peso ottimizzato per account potente: da {original_weight}% a {vote_weight}% (valore voto: {steem_value:.4f} STEEM)")
+                        
+            except Exception as e:
+                logger.warning(f"Errore nel calcolo del valore del voto: {e}")
+        
         return vote_weight
 
     def process_votes(self):
@@ -606,7 +639,7 @@ class VoteSniper:
                 
                 # Ottimizza il peso del voto in base alla potenza di voto
                 original_weight = vote_weight
-                vote_weight = self._optimize_vote_weight_by_voting_power(vote_weight, voting_power)
+                vote_weight = self._optimize_vote_weight_by_voting_power(vote_weight, voting_power, post, platform)
                 
                 # Aggiorna il messaggio di decisione se il peso è stato cambiato
                 if vote_weight != original_weight and vote_weight > 0:

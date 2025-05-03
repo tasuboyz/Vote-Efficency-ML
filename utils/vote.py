@@ -135,13 +135,12 @@ def calculate_optimal_weight_by_power(curator_steem_value, important_voters_data
     avg_whale_power = sum(whale_powers) / len(whale_powers) if whale_powers else 0
     
     # Converte il potere whale in un valore steem approssimativo
-    # Nota: questa è una stima approssimata, poiché il valore esatto
-    # richiederebbe calcoli più complessi con i parametri della blockchain
     estimated_whale_vote_value = avg_whale_power * curator_steem_value / 10000  # Stima rough
     
     # Calcola il rapporto tra il valore del proprio voto e quello stimato dei whale
     if estimated_whale_vote_value <= 0:
-        return base_weight
+        # Prima di ritornare il peso base, verifichiamo il valore assoluto del voto
+        return optimize_weight_by_absolute_value(curator_steem_value, base_weight)
     
     power_ratio = curator_steem_value / estimated_whale_vote_value
     
@@ -151,22 +150,64 @@ def calculate_optimal_weight_by_power(curator_steem_value, important_voters_data
     # Optimizza il peso del voto in base al rapporto di potenza:
     # - Se il tuo voto vale oltre il 50% di quello di un whale tipico, riduci il peso
     if power_ratio >= 0.5:
-        # Formula di riduzione:
-        # - A rapporto 0.5: riduzione al 70%
-        # - A rapporto 0.75: riduzione al 50% 
-        # - A rapporto 1.0 o superiore: riduzione al 30%
-        if power_ratio >= 1.0:
-            reduction_factor = 0.3  # Riduzione massima al 30%
+        # Formula di riduzione più aggressiva per valori elevati di voto
+        if power_ratio >= 1.5:
+            reduction_factor = 0.15  # Riduzione severa al 15%
+        elif power_ratio >= 1.0:
+            reduction_factor = 0.2   # Riduzione molto alta al 20%
         elif power_ratio >= 0.75:
-            reduction_factor = 0.5  # Riduzione intermedia al 50%
+            reduction_factor = 0.35  # Riduzione alta al 35% 
         else:  # power_ratio >= 0.5
-            reduction_factor = 0.7  # Riduzione minima al 70%
+            reduction_factor = 0.5   # Riduzione moderata al 50%
             
+        # Applica la riduzione
         optimized_weight = int(base_weight * reduction_factor)
+        
+        # Applica un'ulteriore ottimizzazione basata sul valore assoluto
+        optimized_weight = optimize_weight_by_absolute_value(curator_steem_value, optimized_weight)
+        
         logger.info(f"Peso voto ridotto da {base_weight}% a {optimized_weight}% " +
                    f"(rapporto di potenza: {power_ratio:.2f})")
         
         return optimized_weight
     
-    # Se il tuo voto è molto più piccolo dei whale, mantieni il peso originale
-    return base_weight
+    # Se il tuo voto è più piccolo dei whale, comunque controlla il valore assoluto
+    return optimize_weight_by_absolute_value(curator_steem_value, base_weight)
+
+def optimize_weight_by_absolute_value(steem_value, base_weight):
+    """
+    Ottimizza il peso del voto in base al valore assoluto in STEEM,
+    indipendentemente dal confronto con i whale.
+    
+    Args:
+        steem_value (float): Valore del voto a peso 100% in STEEM
+        base_weight (int): Peso del voto attuale da ottimizzare
+        
+    Returns:
+        int: Peso ottimizzato (0-100%)
+    """
+    # Calibrazione molto più aggressiva per account con alto valore di voto
+    if steem_value >= 30:  # Estremamente potente (30+ STEEM)
+        target_weight = min(int(base_weight * 0.05), 5)  # Massimo 5% del peso base, non più del 5% assoluto
+        logger.info(f"Voto estremamente potente ({steem_value:.2f} STEEM): peso ridotto drasticamente a {target_weight}%")
+    elif steem_value >= 20:  # Molto potente (20-30 STEEM)
+        target_weight = min(int(base_weight * 0.1), 10)  # Massimo 10% del peso base, non più del 10% assoluto
+        logger.info(f"Voto molto potente ({steem_value:.2f} STEEM): peso ridotto a {target_weight}%") 
+    elif steem_value >= 10:  # Potente (10-20 STEEM)
+        target_weight = min(int(base_weight * 0.15), 15)  # Massimo 15% del peso base, non più del 15% assoluto
+        logger.info(f"Voto potente ({steem_value:.2f} STEEM): peso ridotto a {target_weight}%")
+    elif steem_value >= 5:  # Forte (5-10 STEEM)
+        target_weight = min(int(base_weight * 0.25), 25)  # Massimo 25% del peso base, non più del 25% assoluto
+        logger.info(f"Voto forte ({steem_value:.2f} STEEM): peso ridotto a {target_weight}%")
+    elif steem_value >= 1:  # Moderato (1-5 STEEM)
+        target_weight = min(int(base_weight * 0.5), 50)  # Massimo 50% del peso base, non più del 50% assoluto
+        logger.info(f"Voto moderato ({steem_value:.2f} STEEM): peso ridotto a {target_weight}%")
+    elif steem_value >= 0.5:  # Mite (0.5-1 STEEM) 
+        target_weight = min(int(base_weight * 0.7), 70)  # Massimo 70% del peso base, non più del 70% assoluto
+        logger.info(f"Voto mite ({steem_value:.2f} STEEM): peso ridotto a {target_weight}%")
+    else:
+        # Per valori bassi, mantieni il peso originale
+        return base_weight
+        
+    # Assicurati che il peso non scenda sotto il 1% per garantire un voto minimo
+    return max(target_weight, 1)
