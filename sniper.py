@@ -276,50 +276,42 @@ class VoteSniper:
         # Prendi i top votanti (primi 5 per importanza)
         top_important_voters = sorted_by_importance[:5]
         
-        # Calcola il delay del primo votante per timing
+        # MODIFICA: Invece del primo votante in assoluto, troviamo il votante importante più veloce
+        # Prima ordiniamo i votanti importanti per timing (già fatto con sorted_by_importance)
+        important_voters_by_timing = sorted(top_important_voters, key=lambda x: x['vote_delay_minutes'])
+        
+        # Ora otteniamo il delay del votante importante più veloce
+        fastest_important_delay = important_voters_by_timing[0]['vote_delay_minutes'] if important_voters_by_timing else None
+        fastest_important_voter = important_voters_by_timing[0]['voter'] if important_voters_by_timing else None
+        
+        # Per riferimento, otteniamo comunque il ritardo del primo votante assoluto
         first_voter_delay = sorted_by_timing[0]['vote_delay_minutes'] if sorted_by_timing else None
         
-        # Calcola il delay medio dei top votanti per importanza
+        # Log per debug
+        if fastest_important_delay is not None:
+            logger.info(f"Votante importante più veloce: {fastest_important_voter} (delay: {fastest_important_delay} min)")
+        if first_voter_delay is not None and first_voter_delay < fastest_important_delay:
+            logger.info(f"Attenzione: c'è un votante più veloce ma meno importante a {first_voter_delay} min")
+            
+        # Calcola il delay minimo dei top votanti per importanza
         top_delays = [v['vote_delay_minutes'] for v in top_important_voters]
         top_importance_min_delay = min(top_delays) if top_delays else None
         
-        # Strategia avanzata: consideriamo sia il primo votante che i votanti più importanti
-        if first_voter_delay is not None and top_importance_min_delay is not None:
-            # Se il primo votante è lontano dai votanti più importanti, 
-            # potremmo voler bilanciare i due valori
-            if top_importance_min_delay - first_voter_delay > 3:
-                # Il primo votante per importanza arriva molto dopo il primo per timing
-                logger.info(f"Votanti importanti arrivano significativamente dopo ({top_importance_min_delay} min) " +
-                          f"rispetto al primo votante ({first_voter_delay} min)")
-                
-                # Calcola un delay ottimale che bilancia i due valori
-                # Se i top votanti arrivano molto dopo, diamo comunque più peso
-                # al loro timing per massimizzare l'efficienza
-                weight_for_top_important = 0.7  # 70% del peso per i votanti top
-                optimal_raw = (first_voter_delay * (1 - weight_for_top_important) + 
-                             top_importance_min_delay * weight_for_top_important)
-                
-                # Arrotondiamo e assicuriamo che sia almeno 5 minuti
-                optimal_delay = max(round(optimal_raw - 1), 5)  # -1 per anticipare comunque di 1 minuto
-                
-                # Calcoliamo la finestra di voto
-                voting_window_end = optimal_delay
-                voting_window_start = max(voting_window_end - 3, 5)  # 3 minuti prima della fine della finestra, ma minimo 5 minuti
-                
-                logger.info(f"Bilanciamento tra timing e importanza: selezionato delay ottimale di {optimal_delay} minuti")
-            else:
-                # I votanti importanti votano vicino al primo votante
-                # In questo caso, anticipiamo leggermente il primo votante
-                voting_window_end = max(first_voter_delay - 1, 5)  # 1 minuto prima, ma minimo 5 minuti
-                voting_window_start = max(voting_window_end - 3, 5)  # 3 minuti prima della fine della finestra, ma minimo 5 minuti
-                optimal_delay = voting_window_start + (voting_window_end - voting_window_start) * 0.7
-                
-                logger.info(f"Votanti importanti arrivano subito: ottimizzato per anticiparli tutti a {optimal_delay:.1f} minuti")
+        # Strategia avanzata: ora ci basiamo sul votante importante più veloce
+        if fastest_important_delay is not None:
+            # Calcoliamo un delay ottimale per anticipare il votante importante più veloce
+            voting_window_end = max(fastest_important_delay - 1, 5)  # 1 minuto prima, ma minimo 5 minuti
+            voting_window_start = max(voting_window_end - 3, 5)  # 3 minuti prima della fine della finestra, ma minimo 5 minuti
+            optimal_delay = voting_window_start + (voting_window_end - voting_window_start) * 0.7
+            
+            logger.info(f"Ottimizzato per anticipare il votante importante più veloce di {optimal_delay:.1f} minuti")
         elif first_voter_delay is not None:
-            # Se abbiamo solo il primo votante per timing
+            # Fallback al primo votante se non abbiamo votanti importanti
             voting_window_end = max(first_voter_delay - 1, 5)  # 1 minuto prima, ma minimo 5 minuti
             voting_window_start = max(voting_window_end - 3, 5)  # 3 minuti prima della fine della finestra, ma minimo 5 minuti
             optimal_delay = voting_window_start + (voting_window_end - voting_window_start) * 0.7
+            
+            logger.info(f"Nessun votante importante veloce trovato. Utilizzando il primo votante: {optimal_delay:.1f} minuti")
         else:
             # Caso improbabile: non abbiamo informazioni sui delay
             return None
